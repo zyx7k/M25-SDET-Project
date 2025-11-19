@@ -1,0 +1,13 @@
+[project]
+name = "term-paper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "jaxtyping>=0.3.3",
+    "marimo>=0.17.7",
+    "numpy>=2.3.4",
+    "pint==0.25.1",
+    "plotnine>=0.15.1",
+]
