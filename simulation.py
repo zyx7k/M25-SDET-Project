@@ -238,6 +238,29 @@ def calculate_mu(
 
     return numerator / (c * denominator)
 
+def calculate_mu_vectorized(p0_x, p0_y, p_lk_x, p_lk_y, v_lk_x, v_lk_y, c):
+    """
+    p0_x: (G,) array of candidate x points
+    p0_y: (G,) array of candidate y points
+    p_lk_x, p_lk_y: (k,l)
+    v_lk_x, v_lk_y: (k,l)
+    c: scalar
+    Returns: (G, k, l)
+    """
+
+    # Expand G dimension
+    p0_x = p0_x[:, None, None]
+    p0_y = p0_y[:, None, None]
+
+    p_diff_x = p0_x - p_lk_x[None,:,:]
+    p_diff_y = p0_y - p_lk_y[None,:,:]
+
+    numerator = v_lk_x[None,:,:] * p_diff_x + v_lk_y[None,:,:] * p_diff_y
+    denominator = np.sqrt(p_diff_x**2 + p_diff_y**2)
+    denominator = np.maximum(denominator, 1e-9 * ureg.m)
+
+    return numerator / (c * denominator)
+
 def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[np.ndarray, "timesteps interval"]]) -> Q[Float[np.ndarray, "timesteps receivers interval"]]:
     l = params.num_receivers
     k = params.num_timesteps
@@ -274,7 +297,7 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
     print(signal.shape)
     return signal + w
 
-def estimate_direct_position(params: Params, signal: Q[Float[np.ndarray, "timestep receiver interval"]], p_min: Q[float], p_max: Q[float], p_step: Q[float]) -> tuple[Q[float], Q[float]]:
+def estimate_direct_position(params: Params, signal: Q[Float[np.ndarray, "timestep receiver interval"]], p_min: Q[float], p_max: Q[float], p_step: Q[float], generate_prior_signal: Optional[ Callable[[int, int], Float[np.ndarray, "timesteps interval"]]] = None) -> tuple[Q[float], Q[float]]:
     p_lk_x = params.receivers_p_x
     p_lk_y = params.receivers_p_y
     v_lk_x = params.receivers_v_x
@@ -284,26 +307,35 @@ def estimate_direct_position(params: Params, signal: Q[Float[np.ndarray, "timest
 
     N = params.num_samples_per_interval
 
+    prior_signal = None
+    if generate_prior_signal is not None:
+        k = params.num_timesteps
+        prior_signal = generate_prior_signal(k, N)
+
     max_sum = -np.inf
     p_best = (-np.inf * ureg.m, -np.inf * ureg.m)
 
     # TODO: ensure that units are correct
     xs = np.arange(p_min.to('m').magnitude,
                    p_max.to('m').magnitude,
-                   p_step.to('m').magnitude) * ureg.m
+                   p_step.to('m').magnitude)
     ys = np.arange(p_min.to('m').magnitude,
                    p_max.to('m').magnitude,
-                   p_step.to('m').magnitude) * ureg.m
+                   p_step.to('m').magnitude)
+
+    xs, ys = np.meshgrid(xs, ys)
+    xs = xs.ravel() * ureg.m
+    ys = ys.ravel() * ureg.m
+
+    mus = calculate_mu_vectorized(xs, ys, p_lk_x, p_lk_y, v_lk_x, v_lk_y, c)
 
     data = {
         "xs": [],
         "ys": [],
         "cost": []
     }
-
-    for p_x in xs:
-        for p_y in ys:
-            mu = calculate_mu(p_x, p_y, p_lk_x, p_lk_y, v_lk_x, v_lk_y, c)
+    for p_x, p_y, mu in zip(xs, ys, mus):
+            # mu = calculate_mu(p_x, p_y, p_lk_x, p_lk_y, v_lk_x, v_lk_y, c)
 
             # TODO: calculate this properly
             T_s = 100 / 10000
@@ -311,20 +343,41 @@ def estimate_direct_position(params: Params, signal: Q[Float[np.ndarray, "timest
             # shape: [k, l, n]
             A: Q[Float[np.ndarray, "k l n"]] = np.exp(1j * 2 * np.pi * NOMINAL_CARRIER_FREQUENCY * np.einsum('kl,n->kln', mu, exps))
 
-            V: Q[Float[np.ndarray, "n"]] = np.conjugate(A) * signal
-            Q_k = np.einsum('kln,kmn->klm', V, np.conjugate(V))
+            V: Q[Float[np.ndarray, "k l n"]] = np.conjugate(A) * signal
 
-            eigen_val = np.sum(np.linalg.eigvalsh(Q_k)[:, -1])
-            # print((p_x, p_y), eigen_val, max_sum)
+            if generate_prior_signal is None:
+                # we run the algorithm for unknown signal
+                Q_k = np.einsum('kln,kmn->klm', V, np.conjugate(V))
+
+                cost = np.sum(np.linalg.eigvalsh(Q_k)[:, -1]).m
+                # print((p_x, p_y), eigen_val, max_sum)
+            else:
+                assert prior_signal is not None
+                # we run the algorithm for known signal
+                B = np.einsum('kln,kn->kln', V, prior_signal)
+                G = np.einsum('kli,klj->kij', B.conj(), B)
+                # 3. Extract Diagonals (Summing for alpha) [Shape: K, N]
+                alpha = np.zeros_like(prior_signal, dtype=complex)
+                # We calculate the sums of the diagonals (lags 0 to N-1)
+                for m in range(N):
+                    # G is dimensionless anyways
+                    alpha[:, m] = np.trace(G.m, offset=m, axis1=1, axis2=2)
+                beta = alpha
+                beta[:, 1:] *= 2
+
+                # perform fft
+                fft_out = np.fft.fft(beta.conj(), n=N)
+                cost = np.max(np.real(fft_out), axis=1)
+                cost = np.sum(cost)
 
             data['xs'].append(p_x.to('m').m)
             data['ys'].append(p_y.to('m').m)
-            data['cost'].append(eigen_val.m)
+            data['cost'].append(cost)
 
-            if eigen_val > max_sum:
-                print(eigen_val, max_sum)
+            if cost > max_sum:
+                print(cost, max_sum)
                 print(p_best, (p_x, p_y))
-                max_sum = eigen_val
+                max_sum = cost
                 p_best = (p_x, p_y)
 
     data = {key: np.array(data[key]) for key in data}
@@ -340,7 +393,7 @@ if __name__ == '__main__':
         params = init_position(pos)
         print(params.emitter_x, params.emitter_y)
         signal = simulate_signal(params, sin_signal)
-        estimate, data = estimate_direct_position(params, signal, 0 * ureg.km, 10 * ureg.km, 0.01 * ureg.km)
+        estimate, data = estimate_direct_position(params, signal, 0 * ureg.km, 10 * ureg.km, 0.1 * ureg.km, generate_prior_signal=sin_signal)
         print(estimate)
         print(params.emitter_x, params.emitter_y)
 
@@ -352,4 +405,3 @@ if __name__ == '__main__':
             + p9.geom_hline(yintercept=params.emitter_y.to('m').m)
             + p9.theme_minimal()
         ).save(f'plots/plot_{idx}.png', dpi=300, width=5, height=5)
-        # break
