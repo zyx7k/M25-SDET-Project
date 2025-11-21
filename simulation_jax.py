@@ -36,12 +36,9 @@ class Params:
     noise_stddev: float
 
     # JAX Arrays (Unitless SI)
-    receivers_p_x: Float[Array, "timesteps receivers"]
-    receivers_p_y: Float[Array, "timesteps receivers"]
-    receivers_v_x: Float[Array, "timesteps receivers"]
-    receivers_v_y: Float[Array, "timesteps receivers"]
-    emitter_x: Float[Array, "1"] = field(init=False)
-    emitter_y: Float[Array, "1"] = field(init=False)
+    receivers_p: Float[Array, "2 timesteps receivers"]
+    receivers_v: Float[Array, "2 timesteps receivers"]
+    emitter: Float[Array, "2"] = field(init=False)
     timesteps: Float[Array, "timesteps"] = field(init=False)
     transmitted_freq_shifts: Float[Array, "receivers"] = field(init=False)
     channel_attenuation: Float[Array, "1"] = field(init=False)
@@ -50,18 +47,18 @@ class Params:
 
     def __post_init__(self):
         # check if we have the correct number
-        req_shape = (self.num_timesteps, self.num_receivers)
-        assert self.receivers_p_x.shape == req_shape
-        assert self.receivers_p_y.shape == req_shape
-        assert self.receivers_v_x.shape == req_shape
-        assert self.receivers_v_y.shape == req_shape
+        req_shape = (2, self.num_timesteps, self.num_receivers)
+        assert self.receivers_p.shape == req_shape
+        assert self.receivers_v.shape == req_shape
 
         self.rng = jax.random.key(self.seed)
         self.rng, k1, k2, k3, k4, k5 = jax.random.split(self.rng, 6)
 
         # The emitter’s position is chosen at random within a square area of 10 x 10 [Km x Km].
-        self.emitter_x = jax.random.uniform(k1, minval=0.0, maxval=10_000.0)
-        self.emitter_y = jax.random.uniform(k2, minval=0.0, maxval=10_000.0)
+        self.emitter = jnp.stack([
+            jax.random.uniform(k1, minval=0.0, maxval=10_000.0),
+            jax.random.uniform(k2, minval=0.0, maxval=10_000.0)
+        ])
 
         # The unknown transmitted frequency shifts, {\mathcal{v}_k}, are selected at random
         # from the interval [-100, 100] Hz
@@ -77,13 +74,12 @@ class Params:
         # we also assume that the interception times are the same for all receivers
         # therefore, we can calculate the time simply by taking the max time along x and y
         # (just incase any direction is 0)
-        vx, vy = self.receivers_v_x[:, 0], self.receivers_v_y[:, 0]
-        px, py = self.receivers_p_x[:, 0], self.receivers_p_y[:, 0]
+        v = self.receivers_v[..., 0]
+        p = self.receivers_p[..., 0]
 
-        timesteps_x: Float[Array, "timesteps receivers"] = jnp.where(vx != 0, (px / vx), 0.0)
-        timesteps_y: Float[Array, "timesteps receivers"] = jnp.where(vy != 0, (py / vy), 0.0)
+        timesteps: Float[Array, "timesteps receivers"] = jnp.where(v != 0, (p / v), -jnp.inf)
 
-        self.timesteps = jnp.maximum(timesteps_x, timesteps_y)
+        self.timesteps = jnp.max(timesteps, axis=0)
 
 
 class DefaultPosition(enum.StrEnum):
@@ -137,26 +133,20 @@ def init_position(position: DefaultPosition) -> Params:
         num_receivers=L, num_timesteps=T, num_samples_per_interval=N,
         sample_rate=sample_rate,
         noise_stddev=noise_std,
-        receivers_p_x=p_x,
-        receivers_p_y=p_y,
-        receivers_v_x=v_x,
-        receivers_v_y=v_y,
+        receivers_p=jnp.stack([p_x, p_y]),
+        receivers_v=jnp.stack([v_x, v_y])
     )
 
 @jax.jit
 def calculate_mu(
-        p0_x: Float[Array, "1"],
-        p0_y: Float[Array, "1"],
-        p_lk_x: Float[Array, "k l"],
-        p_lk_y: Float[Array, "k l"],
-        v_lk_x: Float[Array, "k l"],
-        v_lk_y: Float[Array, "k l"],
+        p0: Float[Array, "2"],
+        p_lk: Float[Array, "2 k l"],
+        v_lk: Float[Array, "2 k l"],
         c: float
 ) -> Float[Array, "k l"]:
-    p_diff_x = p0_x - p_lk_x
-    p_diff_y = p0_y - p_lk_y
-    numerator = v_lk_x * p_diff_x + v_lk_y * p_diff_y
-    denominator = jnp.maximum(jnp.sqrt(p_diff_x ** 2 + p_diff_y ** 2), 1e-9)
+    p_diff = p0[:, None, None] - p_lk
+    numerator = jnp.sum(v_lk * p_diff, axis=0)
+    denominator = jnp.maximum(jnp.sqrt(jnp.sum(p_diff ** 2, axis=0)), 1e-9)
     return numerator / (c * denominator)
 
 def sin_signal(k: int, N: int) -> Float[Array, "k N"]:
@@ -173,9 +163,7 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
     w: Float[Array, "k l N"] = jax.random.normal(key, (k, l, N)) * params.noise_stddev
 
     mu: Float[Array, "k l"] = calculate_mu(
-        params.emitter_x, params.emitter_y,
-        params.receivers_p_x, params.receivers_p_y,
-        params.receivers_v_x, params.receivers_v_y,
+        params.emitter, params.receivers_p, params.receivers_v,
         PROPOGATION_SPEED_VAL
     )
 
@@ -189,29 +177,23 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
 
 @jax.jit
 def compute_cost_dd(
-        p_x: Float[Array, "1"],
-        p_y: Float[Array, "1"],
+        p: Float[Array, "2"],
         signal: Complex[Array, "k l n"],
         sample_rate: float,
-        receivers_p_x: Float[Array, "k l"],
-        receivers_p_y: Float[Array, "k l"],
-        receivers_v_x: Float[Array, "k l"],
-        receivers_v_y: Float[Array, "k l"]
+        receivers_p: Float[Array, "2 k l"],
+        receivers_v: Float[Array, "2 k l"]
 ) -> Float[Array, "1"]:
     raise NotImplementedError("TODO")
 
 @jax.jit
 def compute_cost_unknown(
-        p_x: Float[Array, "1"],
-        p_y: Float[Array, "1"],
+        p: Float[Array, "2"],
         signal: Complex[Array, "k l n"],
         exps: Float[Array, "n"],
-        receivers_p_x: Float[Array, "k l"],
-        receivers_p_y: Float[Array, "k l"],
-        receivers_v_x: Float[Array, "k l"],
-        receivers_v_y: Float[Array, "k l"]
+        receivers_p: Float[Array, "2 k l"],
+        receivers_v: Float[Array, "2 k l"]
 ) -> Float[Array, "1"]:
-    mu: Float[Array, "k l"] = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
+    mu: Float[Array, "k l"] = calculate_mu(p, receivers_p, receivers_v, PROPOGATION_SPEED_VAL)
 
     A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
     V: Complex[Array, "k l n"] = jnp.conj(A) * signal
@@ -224,17 +206,14 @@ def compute_cost_unknown(
 
 @jax.jit
 def compute_cost_known(
-        p_x: Float[Array, "1"],
-        p_y: Float[Array, "1"],
+        p: Float[Array, "2"],
         signal: Complex[Array, "k l n"],
         prior_signal: Complex[Array, "k n"],
         exps: Float[Array, "n"],
-        receivers_p_x: Float[Array, "k l"],
-        receivers_p_y: Float[Array, "k l"],
-        receivers_v_x: Float[Array, "k l"],
-        receivers_v_y: Float[Array, "k l"]
+        receivers_p: Float[Array, "2 k l"],
+        receivers_v: Float[Array, "2 k l"]
 ) -> Float[Array, "1"]:
-    mu: Float[Array, "k l"] = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
+    mu: Float[Array, "k l"] = calculate_mu(p, receivers_p, receivers_v, PROPOGATION_SPEED_VAL)
 
     A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
     V: Complex[Array, "k l n"] = jnp.conj(A) * signal
@@ -253,7 +232,7 @@ def compute_cost_known(
     # Find peak energy (best lag) for each timestep and sum
     return jnp.sum(jnp.max(psd_sum, axis=1))
 
-CostFn = Callable[[Float[Array, "N_batch"], Float[Array, "N_batch"]], Float[Array, "1"]]
+CostFn = Callable[[Float[Array, "N_batch 2"]], Float[Array, "1"]]
 def estimate_position(
     params: Params,
     signal: Array,
@@ -262,11 +241,9 @@ def estimate_position(
     p_max: float,
     p_step: float,
     generate_prior_signal: Optional[Callable] = None
-) -> tuple[tuple[Float[Array, "1"], Float[Array, "1"]], dict[str, Float[Array, "N"]]]:
+) -> tuple[Float[Array, "2"], dict[str, Float[Array, "N"]]]:
     grid = jnp.mgrid[p_min:p_max:p_step, p_min:p_max:p_step].reshape(2, -1)
-    flat_xs = grid[0, :]
-    flat_ys = grid[1, :]
-    num_points = flat_xs.shape[0]
+    num_points = grid.shape[1]
 
     T_s = params.num_samples_per_interval / params.sample_rate
     exps: Float[Array, "N"] = jnp.arange(params.num_samples_per_interval) * T_s
@@ -278,46 +255,42 @@ def estimate_position(
     total_padded = num_points + pad
 
     # Pad inputs to divisible size
-    xs_padded: Float[Array, "Np"] = jnp.pad(flat_xs, (0, pad))
-    ys_padded: Float[Array, "Np"] = jnp.pad(flat_ys, (0, pad))
+    grid_padded: Float[Array, "2 Np"] = jnp.pad(grid, ((0,0), (0, pad)))
 
     # Reshape to [num_batches, batch_size]
-    xs_batched: Float[Array, "N_batch batch"] = xs_padded.reshape(-1, batch_size)
-    ys_batched: Float[Array, "N_batch batch"] = ys_padded.reshape(-1, batch_size)
-
+    grid_batched: Float[Array, "2 N_batch batch"] = grid_padded.reshape(2, -1, batch_size)
+    grid_batched:  Float[Array, "N_batch batch 2"] = grid_batched.transpose(1, 2, 0)
 
     match estimation_method, generate_prior_signal:
         case (EstimationMethod.DirectPosition, None):
-            cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+            cost_fn: CostFn = jax.vmap(lambda p: compute_cost_unknown(p, signal, exps, params.receivers_p, params.receivers_v))
         case (EstimationMethod.DirectPosition, f):
             prior: Float[Array, "k n"]  = f(params.num_timesteps, params.num_samples_per_interval)
-            cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+            cost_fn: CostFn = jax.vmap(lambda p: compute_cost_known(p, signal, prior, exps, params.receivers_p, params.receivers_v))
         case (EstimationMethod.DifferentialDoppler, _):
-            cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_dd(x, y, signal, float(params.sample_rate), params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+            cost_fn: CostFn = jax.vmap(lambda p: compute_cost_dd(p, signal, float(params.sample_rate), params.receivers_p, params.receivers_v))
 
     def run_batch(idx_batch: int):
-        b_xs: Float[Array, "N_batch"] = xs_batched[idx_batch]
-        b_ys: Float[Array, "N_batch"] = ys_batched[idx_batch]
+        batch: Float[Array, "N_batch"] = grid_batched[idx_batch]
 
         # note: cost_fn is a vmap
-        return cost_fn(b_xs, b_ys)
+        return cost_fn(batch)
 
-    batch_indices: Int[Array, "N_batch"] = jnp.arange(xs_batched.shape[0])
+    batch_indices: Int[Array, "N_batch"] = jnp.arange(grid_batched.shape[0])
     costs_batched = jax.lax.map(run_batch, batch_indices)
 
     costs: Float[Array, "N_batch batch"] = costs_batched.flatten()[:num_points]
 
     max_idx: Int[Array, "1"] = jnp.argmax(costs)
-    best_x: Float[Array, "best"] = flat_xs[max_idx]
-    best_y: Float[Array, "best"] = flat_ys[max_idx]
+    est = grid[:, max_idx]
 
     data = {
-        "xs": flat_xs,
-        "ys": flat_ys,
+        "xs": grid[0],
+        "ys": grid[1],
         "cost": costs
     }
 
-    return (best_x, best_y), data
+    return est, data
 
 if __name__ == '__main__':
     import time
@@ -325,7 +298,7 @@ if __name__ == '__main__':
         for idx, pos in enumerate([DefaultPosition.PosA, DefaultPosition.PosB, DefaultPosition.PosC, DefaultPosition.PosD]):
             print(f"\n--- Simulation: {pos} ---")
             params = init_position(pos)
-            print(f"Emitter Actual: ({params.emitter_x:.2f}, {params.emitter_y:.2f})")
+            print(f"Emitter Actual: ({params.emitter})")
 
             signal = simulate_signal(params, sin_signal)
 
@@ -333,7 +306,7 @@ if __name__ == '__main__':
             estimate, data = estimate_position(
                 params,
                 signal,
-                EstimationMethod.DifferentialDoppler,
+                EstimationMethod.DirectPosition,
                 0.0,
                 10_000.0,
                 100.0, # 100x100 grid
@@ -341,19 +314,20 @@ if __name__ == '__main__':
             )
             end = time.time()
 
-            est_x, est_y = estimate
-            print(f"Estimate: ({est_x:.2f}, {est_y:.2f})")
-            err = jnp.sqrt((params.emitter_x - est_x)**2 + (params.emitter_y - est_y)**2)
+            est = estimate
+            print(f"Estimate: ({est[0]:.2f}, {est[1]:.2f})")
+            err = jnp.sum(jnp.sqrt((params.emitter - est)**2))
 
             data = pd.DataFrame(data)
             (
                 p9.ggplot(data, p9.aes("xs", "ys", fill="cost"))
                 + p9.geom_tile()
-                + p9.geom_vline(xintercept=params.emitter_x)
-                + p9.geom_hline(yintercept=params.emitter_y)
-                + p9.geom_vline(xintercept=est_x, linetype="dotted")
-                + p9.geom_hline(yintercept=est_y, linetype="dotted")
+                + p9.geom_vline(xintercept=params.emitter[0])
+                + p9.geom_hline(yintercept=params.emitter[1])
+                + p9.geom_vline(xintercept=est[0], linetype="dotted")
+                + p9.geom_hline(yintercept=est[1], linetype="dotted")
                 + p9.theme_minimal()
             ).save(f'jax_plots/{idx}_{SEED}.png', dpi=300, width=5, height=5)
 
-            print(f"Error: {err:.2f} m (Computed in {(end-start) * 1000:.3f}ms)")
+            print(f"Error: {err} m (Computed in {(end-start) * 1000:.3f}ms)")
+        break
