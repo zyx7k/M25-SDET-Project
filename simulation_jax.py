@@ -136,14 +136,22 @@ def init_position(position: DefaultPosition) -> Params:
     )
 
 @jax.jit
-def calculate_mu(p0_x, p0_y, p_lk_x, p_lk_y, v_lk_x, v_lk_y, c):
+def calculate_mu(
+        p0_x: Float[Array, "1"],
+        p0_y: Float[Array, "1"],
+        p_lk_x: Float[Array, "k l"],
+        p_lk_y: Float[Array, "k l"],
+        v_lk_x: Float[Array, "k l"],
+        v_lk_y: Float[Array, "k l"],
+        c: float
+) -> Float[Array, "k l"]:
     p_diff_x = p0_x - p_lk_x
     p_diff_y = p0_y - p_lk_y
     numerator = v_lk_x * p_diff_x + v_lk_y * p_diff_y
     denominator = jnp.maximum(jnp.sqrt(p_diff_x ** 2 + p_diff_y ** 2), 1e-9)
     return numerator / (c * denominator)
 
-def sin_signal(k: int, N: int) -> Array:
+def sin_signal(k: int, N: int) -> Float[Array, "k N"]:
     k_vals = jnp.arange(k)
     n_vals = jnp.arange(N)
     return jnp.sin(2 * jnp.pi * jnp.outer(k_vals, n_vals) / (k * N) + 0.5)
@@ -152,11 +160,11 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
     key = jax.random.PRNGKey(params.seed)
     k, l, N = params.num_timesteps, params.num_receivers, params.num_samples_per_interval
     
-    s = generate_signal(k, N)
-    b = jnp.ones((k, l))
-    w = jax.random.normal(key, (k, l, N)) * params.noise_stddev
+    s: Float[Array, "k N"] = generate_signal(k, N)
+    b: Float[Array, "k l"] = jnp.ones((k, l))
+    w: Float[Array, "k l N"] = jax.random.normal(key, (k, l, N)) * params.noise_stddev
 
-    mu = calculate_mu(
+    mu: Float[Array, "k l"] = calculate_mu(
         params.emitter_x, params.emitter_y,
         params.receivers_p_x, params.receivers_p_y,
         params.receivers_v_x, params.receivers_v_y,
@@ -254,7 +262,7 @@ def estimate_direct_position(
     ys_batched = ys_padded.reshape(-1, batch_size)
 
     # Run loop on device using lax.map
-    def run_batch(idx_batch):
+    def run_batch(idx_batch: int):
         # We actually need to pass the coordinates, scan_fn above used global flat_xs reference
         # Let's redefine to be cleaner
         b_xs = xs_batched[idx_batch]
