@@ -40,22 +40,22 @@ class Params:
     channel_attenuation: float
     channel_phase: float
 
-# Register PyTree
-jax.tree_util.register_pytree_node(
-    Params,
-    lambda p: ((p.receivers_p_x, p.receivers_p_y, p.receivers_v_x, p.receivers_v_y, 
-                p.emitter_x, p.emitter_y, p.timesteps, p.transmitted_freq_shifts,
-                p.channel_attenuation, p.channel_phase), 
-               (p.seed, p.num_receivers, p.num_timesteps, p.num_samples_per_interval, p.noise_stddev)),
-    lambda aux, children: Params(
-        seed=aux[0], num_receivers=aux[1], num_timesteps=aux[2], 
-        num_samples_per_interval=aux[3], noise_stddev=aux[4],
-        receivers_p_x=children[0], receivers_p_y=children[1], receivers_v_x=children[2],
-        receivers_v_y=children[3], emitter_x=children[4], emitter_y=children[5],
-        timesteps=children[6], transmitted_freq_shifts=children[7],
-        channel_attenuation=children[8], channel_phase=children[9]
-    )
-)
+# # Register PyTree
+# jax.tree_util.register_pytree_node(
+#     Params,
+#     lambda p: ((p.receivers_p_x, p.receivers_p_y, p.receivers_v_x, p.receivers_v_y, 
+#                 p.emitter_x, p.emitter_y, p.timesteps, p.transmitted_freq_shifts,
+#                 p.channel_attenuation, p.channel_phase), 
+#                (p.seed, p.num_receivers, p.num_timesteps, p.num_samples_per_interval, p.noise_stddev)),
+#     lambda aux, children: Params(
+#         seed=aux[0], num_receivers=aux[1], num_timesteps=aux[2], 
+#         num_samples_per_interval=aux[3], noise_stddev=aux[4],
+#         receivers_p_x=children[0], receivers_p_y=children[1], receivers_v_x=children[2],
+#         receivers_v_y=children[3], emitter_x=children[4], emitter_y=children[5],
+#         timesteps=children[6], transmitted_freq_shifts=children[7],
+#         channel_attenuation=children[8], channel_phase=children[9]
+#     )
+# )
 
 class DefaultPosition(enum.StrEnum):
     PosA = 'A'
@@ -178,9 +178,9 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
 # --- Optimized Estimation Kernels ---
 
 @jax.jit
-def compute_cost_unknown(p_x, p_y, signal, exps, params):
+def compute_cost_unknown(p_x, p_y, signal, exps, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y):
     # Unknown signal: Uses eigenvalues of the covariance matrix
-    mu = calculate_mu(p_x, p_y, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y, PROPOGATION_SPEED_VAL)
+    mu = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
     
     A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
     V = jnp.conj(A) * signal
@@ -194,10 +194,10 @@ def compute_cost_unknown(p_x, p_y, signal, exps, params):
     return jnp.sum(eigvals[:, -1]).real
 
 @jax.jit
-def compute_cost_known(p_x, p_y, signal, prior_signal, exps, params):
+def compute_cost_known(p_x, p_y, signal, prior_signal, exps, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y):
     # Known signal: Uses FFT-based correlation (Wiener-Khinchin Theorem)
     # O(N log N) instead of O(N^2)
-    mu = calculate_mu(p_x, p_y, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y, PROPOGATION_SPEED_VAL)
+    mu = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
     
     # Demodulate Doppler shift
     A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
@@ -270,10 +270,10 @@ def estimate_direct_position(
         b_xs = xs_batched[idx_batch]
         b_ys = ys_batched[idx_batch]
         if generate_prior_signal is None:
-            return jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params))(b_xs, b_ys)
+            return jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))(b_xs, b_ys)
         else:
             prior = generate_prior_signal(params.num_timesteps, params.num_samples_per_interval)
-            return jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params))(b_xs, b_ys)
+            return jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))(b_xs, b_ys)
 
     # Use jax.lax.map to loop over batches
     # range is just indices 0..num_batches
