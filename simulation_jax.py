@@ -178,11 +178,9 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
 # --- Optimized Estimation Kernels ---
 
 @jax.jit
-def compute_cost_unknown(p_x, p_y, signal, params):
+def compute_cost_unknown(p_x, p_y, signal, exps, params):
     # Unknown signal: Uses eigenvalues of the covariance matrix
     mu = calculate_mu(p_x, p_y, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y, PROPOGATION_SPEED_VAL)
-    T_s = 100.0 / 10000.0
-    exps = jnp.arange(params.num_samples_per_interval) * T_s
     
     A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
     V = jnp.conj(A) * signal
@@ -196,12 +194,10 @@ def compute_cost_unknown(p_x, p_y, signal, params):
     return jnp.sum(eigvals[:, -1]).real
 
 @jax.jit
-def compute_cost_known(p_x, p_y, signal, prior_signal, params):
+def compute_cost_known(p_x, p_y, signal, prior_signal, exps, params):
     # Known signal: Uses FFT-based correlation (Wiener-Khinchin Theorem)
     # O(N log N) instead of O(N^2)
     mu = calculate_mu(p_x, p_y, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y, PROPOGATION_SPEED_VAL)
-    T_s = 100.0 / 10000.0
-    exps = jnp.arange(params.num_samples_per_interval) * T_s
     
     # Demodulate Doppler shift
     A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
@@ -242,15 +238,9 @@ def estimate_direct_position(
     flat_xs = jnp.array(grid_xs.ravel())
     flat_ys = jnp.array(grid_ys.ravel())
     num_points = flat_xs.shape[0]
-    
-    # 2. Prepare Scanning Function
-    if generate_prior_signal is None:
-        def scan_fn(idx):
-            return compute_cost_unknown(flat_xs[idx], flat_ys[idx], signal, params)
-    else:
-        prior = generate_prior_signal(params.num_timesteps, params.num_samples_per_interval)
-        def scan_fn(idx):
-            return compute_cost_known(flat_xs[idx], flat_ys[idx], signal, prior, params)
+
+    T_s = 100.0 / 10000.0
+    exps = jnp.arange(params.num_samples_per_interval) * T_s
 
     # 3. Execution with Batching via jax.lax.map
     # Instead of Python looping, we map the function over indices directly on device.
@@ -272,10 +262,7 @@ def estimate_direct_position(
     # Reshape to [num_batches, batch_size]
     xs_batched = xs_padded.reshape(-1, batch_size)
     ys_batched = ys_padded.reshape(-1, batch_size)
-    
-    # Define batched kernel
-    batched_kernel = jax.vmap(scan_fn) # Vectorizes over batch dimension
-    
+
     # Run loop on device using lax.map
     def run_batch(idx_batch):
         # We actually need to pass the coordinates, scan_fn above used global flat_xs reference
@@ -283,10 +270,10 @@ def estimate_direct_position(
         b_xs = xs_batched[idx_batch]
         b_ys = ys_batched[idx_batch]
         if generate_prior_signal is None:
-            return jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, params))(b_xs, b_ys)
+            return jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params))(b_xs, b_ys)
         else:
             prior = generate_prior_signal(params.num_timesteps, params.num_samples_per_interval)
-            return jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, params))(b_xs, b_ys)
+            return jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params))(b_xs, b_ys)
 
     # Use jax.lax.map to loop over batches
     # range is just indices 0..num_batches
