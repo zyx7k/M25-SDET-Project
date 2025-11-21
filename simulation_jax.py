@@ -224,8 +224,7 @@ def estimate_direct_position(
     p_max: float, 
     p_step: float, 
     generate_prior_signal: Optional[Callable] = None
-) -> Tuple[Tuple[float, float], dict]:
-) -> Tuple[Tuple[float, float], dict[str, Float[np.ndarray, "N"]]]:
+) -> Tuple[Tuple[Float[Array, "1"], Float[Array, "1"]], dict[str, Float[np.ndarray, "N"]]]:
     grid = jnp.mgrid[p_min:p_max:p_step, p_min:p_max:p_step].reshape(2, -1)
     flat_xs = grid[0, :]
     flat_ys = grid[1, :]
@@ -275,19 +274,14 @@ def estimate_direct_position(
     # Flatten and slice off padding
     costs = costs_batched.flatten()[:num_points]
     
-    # Move to host
-    costs_np = np.array(costs)
-    flat_xs_np = np.array(flat_xs)
-    flat_ys_np = np.array(flat_ys)
-    
-    max_idx = np.argmax(costs_np)
-    best_x = flat_xs_np[max_idx]
-    best_y = flat_ys_np[max_idx]
+    max_idx = jnp.argmax(costs)
+    best_x = flat_xs[max_idx]
+    best_y = flat_ys[max_idx]
 
     data = {
-        "xs": flat_xs_np,
-        "ys": flat_ys_np,
-        "cost": costs_np
+        "xs": flat_xs,
+        "ys": flat_ys,
+        "cost": costs
     }
     
     return (best_x, best_y), data
@@ -323,6 +317,8 @@ if __name__ == '__main__':
                 + p9.geom_tile()
                 + p9.geom_vline(xintercept=params.emitter_x)
                 + p9.geom_hline(yintercept=params.emitter_y)
+                + p9.geom_vline(xintercept=est_x, linetype="dotted")
+                + p9.geom_hline(yintercept=est_y, linetype="dotted")
                 + p9.theme_minimal()
             ).save(f'jax_plots/__{idx}_{SEED}.png', dpi=300, width=5, height=5)
             
