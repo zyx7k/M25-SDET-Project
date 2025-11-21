@@ -19,6 +19,10 @@ PROPOGATION_SPEED_VAL = 300_000_000.0
 NOMINAL_CARRIER_FREQUENCY_VAL = 100_000_000.0
 DEFAULT_RECEIVER_SPEED_VAL = 300.0
 
+class EstimationMethod(enum.StrEnum):
+    DirectPosition = "DPD"
+    DifferentialDoppler = "DD"
+
 @dataclass
 class Params:
     seed: int
@@ -184,6 +188,19 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
     return (b[:, :, None] * A * C[:, None, :] * s[:, None, :]) + w
 
 @jax.jit
+def compute_cost_dd(
+        p_x: Float[Array, "1"],
+        p_y: Float[Array, "1"],
+        signal: Complex[Array, "k l n"],
+        sample_rate: float,
+        receivers_p_x: Float[Array, "k l"],
+        receivers_p_y: Float[Array, "k l"],
+        receivers_v_x: Float[Array, "k l"],
+        receivers_v_y: Float[Array, "k l"]
+) -> Float[Array, "1"]:
+    raise NotImplementedError("TODO")
+
+@jax.jit
 def compute_cost_unknown(
         p_x: Float[Array, "1"],
         p_y: Float[Array, "1"],
@@ -224,22 +241,6 @@ def compute_cost_known(
     # correlation with prior
     B: Complex[Array, "k l n"] = V * prior_signal[:, None, :]
 
-    # G = jnp.einsum('kli,klj->kij', jnp.conj(B), B)
-
-    # def get_diag_sum(m):
-    #     return jnp.trace(G, offset=m, axis1=1, axis2=2)
-
-
-    # N = G.shape[-1]
-    # alpha = jax.vmap(get_diag_sum)(jnp.arange(N)).T
-
-    # mask = jnp.ones(N)
-    # mask = mask.at[1:].set(2.0)
-    # beta = alpha * mask[None, :]
-
-    # fft_out = jnp.fft.fft(jnp.conj(beta), n=N, axis=1)
-    # return jnp.sum(jnp.max(jnp.real(fft_out), axis=1))
-
     # Calculate energy at different time-lags via FFT
     # FFT of Autocorrelation = |FFT(Signal)|^2 (Power Spectral Density)
     # This replaces the O(N^2) matrix construction
@@ -253,9 +254,10 @@ def compute_cost_known(
     return jnp.sum(jnp.max(psd_sum, axis=1))
 
 CostFn = Callable[[Float[Array, "N_batch"], Float[Array, "N_batch"]], Float[Array, "1"]]
-def estimate_direct_position(
+def estimate_position(
     params: Params,
     signal: Array,
+    estimation_method: EstimationMethod,
     p_min: float,
     p_max: float,
     p_step: float,
@@ -284,11 +286,14 @@ def estimate_direct_position(
     ys_batched: Float[Array, "N_batch batch"] = ys_padded.reshape(-1, batch_size)
 
 
-    if generate_prior_signal is None:
-        cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
-    else:
-        prior: Float[Array, "k n"]  = generate_prior_signal(params.num_timesteps, params.num_samples_per_interval)
-        cost_fn = jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+    match estimation_method, generate_prior_signal:
+        case (EstimationMethod.DirectPosition, None):
+            cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+        case (EstimationMethod.DirectPosition, f):
+            prior: Float[Array, "k n"]  = f(params.num_timesteps, params.num_samples_per_interval)
+            cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+        case (EstimationMethod.DifferentialDoppler, _):
+            cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_dd(x, y, signal, float(params.sample_rate), params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
 
     def run_batch(idx_batch: int):
         b_xs: Float[Array, "N_batch"] = xs_batched[idx_batch]
@@ -325,9 +330,10 @@ if __name__ == '__main__':
             signal = simulate_signal(params, sin_signal)
 
             start = time.time()
-            estimate, data = estimate_direct_position(
+            estimate, data = estimate_position(
                 params,
                 signal,
+                EstimationMethod.DifferentialDoppler,
                 0.0,
                 10_000.0,
                 100.0, # 100x100 grid
