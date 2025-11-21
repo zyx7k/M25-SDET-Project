@@ -225,15 +225,10 @@ def estimate_direct_position(
     p_step: float, 
     generate_prior_signal: Optional[Callable] = None
 ) -> Tuple[Tuple[float, float], dict]:
-    
-    # 1. Create Grid
-    xs = np.arange(p_min, p_max, p_step)
-    ys = np.arange(p_min, p_max, p_step)
-    grid_xs, grid_ys = np.meshgrid(xs, ys)
-    
-    # Shape: [Num_Points]
-    flat_xs = jnp.array(grid_xs.ravel())
-    flat_ys = jnp.array(grid_ys.ravel())
+) -> Tuple[Tuple[float, float], dict[str, Float[np.ndarray, "N"]]]:
+    grid = jnp.mgrid[p_min:p_max:p_step, p_min:p_max:p_step].reshape(2, -1)
+    flat_xs = grid[0, :]
+    flat_ys = grid[1, :]
     num_points = flat_xs.shape[0]
 
     T_s = 100.0 / 10000.0
