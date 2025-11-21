@@ -234,15 +234,15 @@ def compute_cost_known(p_x, p_y, signal, prior_signal, params):
 def estimate_direct_position(
     params: Params, 
     signal: Array, 
-    p_min: pint.Quantity, 
-    p_max: pint.Quantity, 
-    p_step: pint.Quantity, 
+    p_min: float, 
+    p_max: float, 
+    p_step: float, 
     generate_prior_signal: Optional[Callable] = None
 ) -> Tuple[Tuple[float, float], dict]:
     
     # 1. Create Grid
-    xs = np.arange(p_min.to('m').magnitude, p_max.to('m').magnitude, p_step.to('m').magnitude)
-    ys = np.arange(p_min.to('m').magnitude, p_max.to('m').magnitude, p_step.to('m').magnitude)
+    xs = np.arange(p_min, p_max, p_step)
+    ys = np.arange(p_min, p_max, p_step)
     grid_xs, grid_ys = np.meshgrid(xs, ys)
     
     # Shape: [Num_Points]
@@ -334,16 +334,15 @@ if __name__ == '__main__':
             estimate, data = estimate_direct_position(
                 params, 
                 signal, 
-                0 * ureg.km, 
-                10 * ureg.km, 
-                0.01 * ureg.km, # 100x100 grid
+                0.0, 
+                10_000.0, 
+                100.0, # 100x100 grid
                 # generate_prior_signal=sin_signal
             )
             end = time.time()
             
             est_x, est_y = estimate
             print(f"Estimate: ({est_x:.2f}, {est_y:.2f})")
-            
             err = np.sqrt((params.emitter_x - est_x)**2 + (params.emitter_y - est_y)**2)
 
             data = pd.DataFrame(data)
