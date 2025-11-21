@@ -1,6 +1,6 @@
 import sys
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Callable, Tuple
 
 import jax
@@ -23,6 +23,8 @@ DEFAULT_RECEIVER_SPEED_VAL = 300.0
 @dataclass
 class Params:
     seed: int
+    rng: Array = field(init=False)
+
     num_receivers: int
     num_timesteps: int
     num_samples_per_interval: int
@@ -33,29 +35,51 @@ class Params:
     receivers_p_y: Float[Array, "timesteps receivers"]
     receivers_v_x: Float[Array, "timesteps receivers"]
     receivers_v_y: Float[Array, "timesteps receivers"]
-    emitter_x: float
-    emitter_y: float
-    timesteps: Float[Array, "timesteps"]
-    transmitted_freq_shifts: Float[Array, "receivers"]
-    channel_attenuation: float
-    channel_phase: float
+    emitter_x: Float[Array, "1"] = field(init=False)
+    emitter_y: Float[Array, "1"] = field(init=False)
+    timesteps: Float[Array, "timesteps"] = field(init=False)
+    transmitted_freq_shifts: Float[Array, "receivers"] = field(init=False)
+    channel_attenuation: Float[Array, "1"] = field(init=False)
+    channel_phase: Float[Array, "1"] = field(init=False)
 
-# # Register PyTree
-# jax.tree_util.register_pytree_node(
-#     Params,
-#     lambda p: ((p.receivers_p_x, p.receivers_p_y, p.receivers_v_x, p.receivers_v_y, 
-#                 p.emitter_x, p.emitter_y, p.timesteps, p.transmitted_freq_shifts,
-#                 p.channel_attenuation, p.channel_phase), 
-#                (p.seed, p.num_receivers, p.num_timesteps, p.num_samples_per_interval, p.noise_stddev)),
-#     lambda aux, children: Params(
-#         seed=aux[0], num_receivers=aux[1], num_timesteps=aux[2], 
-#         num_samples_per_interval=aux[3], noise_stddev=aux[4],
-#         receivers_p_x=children[0], receivers_p_y=children[1], receivers_v_x=children[2],
-#         receivers_v_y=children[3], emitter_x=children[4], emitter_y=children[5],
-#         timesteps=children[6], transmitted_freq_shifts=children[7],
-#         channel_attenuation=children[8], channel_phase=children[9]
-#     )
-# )
+
+    def __post_init__(self):
+        # check if we have the correct number
+        req_shape = (self.num_timesteps, self.num_receivers)
+        assert self.receivers_p_x.shape == req_shape
+        assert self.receivers_p_y.shape == req_shape
+        assert self.receivers_v_x.shape == req_shape
+        assert self.receivers_v_y.shape == req_shape
+
+        self.rng = jax.random.key(self.seed)
+        self.rng, k1, k2, k3, k4, k5 = jax.random.split(self.rng, 6)
+
+        # The emitter’s position is chosen at random within a square area of 10 x 10 [Km x Km].
+        self.emitter_x = jax.random.uniform(k1, minval=0.0, maxval=10_000.0)
+        self.emitter_y = jax.random.uniform(k2, minval=0.0, maxval=10_000.0)
+
+        # The unknown transmitted frequency shifts, {\mathcal{v}_k}, are selected at random
+        # from the interval [-100, 100] Hz
+        self.transmitted_freq_shifts = jax.random.uniform(k3, (self.num_timesteps,), minval=-100.0, maxval=100.0)
+        # The channel attenuation is selected at random from a normal distribution with
+        # mean one and standard deviation 0.1
+        self.channel_attenuation = 1 + 0.1 * jax.random.normal(k4)
+        # and the channel phase is selected at random from a
+        # uniform distribution over [-pi, pi]
+        self.channel_phase = jax.random.uniform(k5, minval=-jnp.pi, maxval=jnp.pi)
+
+        # we assume that the velocity vector remains constant between each interception interval
+        # we also assume that the interception times are the same for all receivers
+        # therefore, we can calculate the time simply by taking the max time along x and y
+        # (just incase any direction is 0)
+        vx, vy = self.receivers_v_x[:, 0], self.receivers_v_y[:, 0]
+        px, py = self.receivers_p_x[:, 0], self.receivers_p_y[:, 0]
+
+        timesteps_x: Float[Array, "timesteps receivers"] = jnp.where(vx != 0, (px / vx), 0.0)
+        timesteps_y: Float[Array, "timesteps receivers"] = jnp.where(vy != 0, (py / vy), 0.0)
+
+        self.timesteps = jnp.maximum(timesteps_x, timesteps_y)
+
 
 class DefaultPosition(enum.StrEnum):
     PosA = 'A'
@@ -65,78 +89,51 @@ class DefaultPosition(enum.StrEnum):
     PosTest = 'Test'
 
 def init_position(position: DefaultPosition) -> Params:
-    rng = np.random.default_rng(SEED)
     noise_std = 1.0
     
     match position:
         case DefaultPosition.PosA:
             L, T = 2, 10
-            p_x = np.stack([np.arange(1, 11), np.arange(10, 0, -1)]).T * 1000.0
-            p_y = np.stack([np.full(T, 0.0), np.full(T, 10.0)]).T * 1000.0
-            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
-            v_y = np.zeros((T, L), dtype=np.float32)
+            p_x = jnp.stack([jnp.arange(1, 11), jnp.arange(10, 0, -1)]).T * 1000.0
+            p_y = jnp.stack([jnp.full(T, 0.0), jnp.full(T, 10.0)]).T * 1000.0
+            v_x = jnp.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
+            v_y = jnp.zeros((T, L), dtype=jnp.float32)
         case DefaultPosition.PosB:
             L, T = 3, 10
-            p_x = np.stack([np.arange(1, 11), np.arange(10, 0, -1), np.arange(1, 11)]).T * 1000
-            p_y = np.stack([np.full(T, 0.0), np.full(T, 10.0), np.full(T, 0.2)]).T * 1000
-            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
-            v_y = np.zeros((T, L), dtype=np.float32)
+            p_x = jnp.stack([jnp.arange(1, 11), jnp.arange(10, 0, -1), jnp.arange(1, 11)]).T * 1000
+            p_y = jnp.stack([jnp.full(T, 0.0), jnp.full(T, 10.0), jnp.full(T, 0.2)]).T * 1000
+            v_x = jnp.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
+            v_y = jnp.zeros((T, L), dtype=jnp.float32)
         case DefaultPosition.PosC:
             L, T = 2, 10
-            p_x = np.stack([np.arange(1, 11), np.full(T, 10.0)]).T * 1000
-            p_y = np.stack([np.full(T, 0.0), np.arange(1, 11)]).T * 1000
-            v_x = np.stack([np.full(T, DEFAULT_RECEIVER_SPEED_VAL), np.zeros(T)]).T
-            v_y = np.stack([np.zeros(T), np.full(T, DEFAULT_RECEIVER_SPEED_VAL)]).T
+            p_x = jnp.stack([jnp.arange(1, 11), jnp.full(T, 10.0)]).T * 1000
+            p_y = jnp.stack([jnp.full(T, 0.0), jnp.arange(1, 11)]).T * 1000
+            v_x = jnp.stack([jnp.full(T, DEFAULT_RECEIVER_SPEED_VAL), jnp.zeros(T)]).T
+            v_y = jnp.stack([jnp.zeros(T), jnp.full(T, DEFAULT_RECEIVER_SPEED_VAL)]).T
         case DefaultPosition.PosD:
             L, T = 2, 10
-            p_x = np.tile(np.arange(1, 11), (L, 1)).T * 1000
-            p_y = np.stack([np.full(T, 0.0), np.full(T, -0.5)]).T * 1000
-            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
-            v_y = np.zeros((T, L))
+            p_x = jnp.tile(jnp.arange(1, 11), (L, 1)).T * 1000
+            p_y = jnp.stack([jnp.full(T, 0.0), jnp.full(T, -0.5)]).T * 1000
+            v_x = jnp.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
+            v_y = jnp.zeros((T, L))
         case DefaultPosition.PosTest:
             L, T = 2, 4
             noise_std = 0.0
-            p_x = np.array([[0.0, 1000.0], [300.0, 1300.0], [600.0, 1600.0], [900.0, 1900.0]])
-            p_y = np.zeros((T, L))
-            v_x = np.full((T, L), 300.0, dtype=np.float32)
-            v_y = np.zeros((T, L))
+            p_x = jnp.array([[0.0, 1000.0], [300.0, 1300.0], [600.0, 1600.0], [900.0, 1900.0]])
+            p_y = jnp.zeros((T, L))
+            v_x = jnp.full((T, L), 300.0, dtype=jnp.float32)
+            v_y = jnp.zeros((T, L))
 
-    N = 100 if position != DefaultPosition.PosTest else 128
-
-    if position == DefaultPosition.PosTest:
-        emitter_x_val, emitter_y_val = 400.0, 300.0
-        shifts = np.zeros(T)
-        attenuation, phase = 1.0, 0.0
-    else:
-        emitter_x_val = rng.uniform(0, 10_000) 
-        emitter_y_val = rng.uniform(0, 10_000)
-        shifts = rng.uniform(-100, 100, T)
-        attenuation = rng.normal(1, 0.1)
-        phase = rng.uniform(-np.pi, np.pi)
-
-    # Calculate Timesteps
-    vx_m, vy_m = v_x[:, 0], v_y[:, 0]
-    px_m, py_m = p_x[:, 0], p_y[:, 0]
-    
-    with np.errstate(divide='ignore', invalid='ignore'):
-        t_x = np.where(vx_m != 0, px_m / vx_m, 0.0)
-        t_y = np.where(vy_m != 0, py_m / vy_m, 0.0)
-    timesteps_val = np.maximum(t_x, t_y)
+    N = 100
 
     return Params(
         seed=SEED,
         num_receivers=L, num_timesteps=T, num_samples_per_interval=N,
         noise_stddev=noise_std,
-        receivers_p_x=jnp.array(p_x),
-        receivers_p_y=jnp.array(p_y),
-        receivers_v_x=jnp.array(v_x),
-        receivers_v_y=jnp.array(v_y),
-        emitter_x=jnp.array(emitter_x_val),
-        emitter_y=jnp.array(emitter_y_val),
-        timesteps=jnp.array(timesteps_val),
-        transmitted_freq_shifts=jnp.array(shifts),
-        channel_attenuation=jnp.array(attenuation),
-        channel_phase=jnp.array(phase)
+        receivers_p_x=p_x,
+        receivers_p_y=p_y,
+        receivers_v_x=v_x,
+        receivers_v_y=v_y,
     )
 
 @jax.jit
