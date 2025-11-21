@@ -7,7 +7,6 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Float, Complex
-import numpy as np
 import pandas as pd
 import plotnine as p9
 
@@ -224,7 +223,7 @@ def estimate_direct_position(
     p_max: float, 
     p_step: float, 
     generate_prior_signal: Optional[Callable] = None
-) -> Tuple[Tuple[Float[Array, "1"], Float[Array, "1"]], dict[str, Float[np.ndarray, "N"]]]:
+) -> tuple[tuple[Float[Array, "1"], Float[Array, "1"]], dict[str, Float[Array, "N"]]]:
     grid = jnp.mgrid[p_min:p_max:p_step, p_min:p_max:p_step].reshape(2, -1)
     flat_xs = grid[0, :]
     flat_ys = grid[1, :]
