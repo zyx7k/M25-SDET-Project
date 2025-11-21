@@ -8,15 +8,12 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Float, Complex
 import numpy as np
-import pint
 import pandas as pd
 import plotnine as p9
 
 # jax.config.update("jax_enable_x64", True)
 
 SEED = 42
-
-ureg = pint.UnitRegistry(force_ndarray=True)
 
 # Physical Constants
 PROPOGATION_SPEED_VAL = 300_000_000.0
@@ -68,45 +65,41 @@ class DefaultPosition(enum.StrEnum):
     PosTest = 'Test'
 
 def init_position(position: DefaultPosition) -> Params:
-    km = ureg.kilometer
-    mps = ureg.meter_per_second
-    m = ureg.meter
-    
     rng = np.random.default_rng(SEED)
     noise_std = 1.0
     
     match position:
         case DefaultPosition.PosA:
             L, T = 2, 10
-            p_x = np.stack([np.arange(1, 11), np.arange(10, 0, -1)]).T * km
-            p_y = np.stack([np.full(T, 0.0), np.full(T, 10.0)]).T * km
-            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL) * mps
-            v_y = np.zeros((T, L)) * mps
+            p_x = np.stack([np.arange(1, 11), np.arange(10, 0, -1)]).T * 1000.0
+            p_y = np.stack([np.full(T, 0.0), np.full(T, 10.0)]).T * 1000.0
+            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
+            v_y = np.zeros((T, L), dtype=np.float32)
         case DefaultPosition.PosB:
             L, T = 3, 10
-            p_x = np.stack([np.arange(1, 11), np.arange(10, 0, -1), np.arange(1, 11)]).T * km
-            p_y = np.stack([np.full(T, 0.0), np.full(T, 10.0), np.full(T, 0.2)]).T * km
-            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL) * mps
-            v_y = np.zeros((T, L)) * mps
+            p_x = np.stack([np.arange(1, 11), np.arange(10, 0, -1), np.arange(1, 11)]).T * 1000
+            p_y = np.stack([np.full(T, 0.0), np.full(T, 10.0), np.full(T, 0.2)]).T * 1000
+            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
+            v_y = np.zeros((T, L), dtype=np.float32)
         case DefaultPosition.PosC:
             L, T = 2, 10
-            p_x = np.stack([np.arange(1, 11), np.full(T, 10.0)]).T * km
-            p_y = np.stack([np.full(T, 0.0), np.arange(1, 11)]).T * km
-            v_x = np.stack([np.full(T, DEFAULT_RECEIVER_SPEED_VAL), np.zeros(T)]).T * mps
-            v_y = np.stack([np.zeros(T), np.full(T, DEFAULT_RECEIVER_SPEED_VAL)]).T * mps
+            p_x = np.stack([np.arange(1, 11), np.full(T, 10.0)]).T * 1000
+            p_y = np.stack([np.full(T, 0.0), np.arange(1, 11)]).T * 1000
+            v_x = np.stack([np.full(T, DEFAULT_RECEIVER_SPEED_VAL), np.zeros(T)]).T
+            v_y = np.stack([np.zeros(T), np.full(T, DEFAULT_RECEIVER_SPEED_VAL)]).T
         case DefaultPosition.PosD:
             L, T = 2, 10
-            p_x = np.tile(np.arange(1, 11), (L, 1)).T * km
-            p_y = np.stack([np.full(T, 0.0), np.full(T, -0.5)]).T * km
-            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL) * mps
-            v_y = np.zeros((T, L)) * mps
+            p_x = np.tile(np.arange(1, 11), (L, 1)).T * 1000
+            p_y = np.stack([np.full(T, 0.0), np.full(T, -0.5)]).T * 1000
+            v_x = np.full((T, L), DEFAULT_RECEIVER_SPEED_VAL)
+            v_y = np.zeros((T, L))
         case DefaultPosition.PosTest:
             L, T = 2, 4
             noise_std = 0.0
-            p_x = np.array([[0.0, 1000.0], [300.0, 1300.0], [600.0, 1600.0], [900.0, 1900.0]]) * m
-            p_y = np.zeros((T, L)) * m
-            v_x = np.full((T, L), 300) * mps
-            v_y = np.zeros((T, L)) * mps
+            p_x = np.array([[0.0, 1000.0], [300.0, 1300.0], [600.0, 1600.0], [900.0, 1900.0]])
+            p_y = np.zeros((T, L))
+            v_x = np.full((T, L), 300.0, dtype=np.float32)
+            v_y = np.zeros((T, L))
 
     N = 100 if position != DefaultPosition.PosTest else 128
 
@@ -122,8 +115,8 @@ def init_position(position: DefaultPosition) -> Params:
         phase = rng.uniform(-np.pi, np.pi)
 
     # Calculate Timesteps
-    vx_m, vy_m = v_x[:, 0].to('m/s').m, v_y[:, 0].to('m/s').m
-    px_m, py_m = p_x[:, 0].to('m').m, p_y[:, 0].to('m').m
+    vx_m, vy_m = v_x[:, 0], v_y[:, 0]
+    px_m, py_m = p_x[:, 0], p_y[:, 0]
     
     with np.errstate(divide='ignore', invalid='ignore'):
         t_x = np.where(vx_m != 0, px_m / vx_m, 0.0)
@@ -134,10 +127,10 @@ def init_position(position: DefaultPosition) -> Params:
         seed=SEED,
         num_receivers=L, num_timesteps=T, num_samples_per_interval=N,
         noise_stddev=noise_std,
-        receivers_p_x=jnp.array(p_x.to('m').m),
-        receivers_p_y=jnp.array(p_y.to('m').m),
-        receivers_v_x=jnp.array(v_x.to('m/s').m),
-        receivers_v_y=jnp.array(v_y.to('m/s').m),
+        receivers_p_x=jnp.array(p_x),
+        receivers_p_y=jnp.array(p_y),
+        receivers_v_x=jnp.array(v_x),
+        receivers_v_y=jnp.array(v_y),
         emitter_x=jnp.array(emitter_x_val),
         emitter_y=jnp.array(emitter_y_val),
         timesteps=jnp.array(timesteps_val),
@@ -337,7 +330,7 @@ if __name__ == '__main__':
                 0.0, 
                 10_000.0, 
                 100.0, # 100x100 grid
-                # generate_prior_signal=sin_signal
+                generate_prior_signal=sin_signal
             )
             end = time.time()
             
