@@ -33,7 +33,7 @@ class Params:
     num_samples_per_interval: int
     sample_rate: int
 
-    noise_stddev: float
+    snr_ratio: float
 
     # JAX Arrays (Unitless SI)
     receivers_p: Float[Array, "2 timesteps receivers"]
@@ -90,7 +90,7 @@ class DefaultPosition(enum.StrEnum):
     PosTest = 'Test'
 
 def init_position(position: DefaultPosition) -> Params:
-    noise_std = 1.0
+    snr_ratio = 1.0
     sample_rate = 10_000
 
     match position:
@@ -120,7 +120,7 @@ def init_position(position: DefaultPosition) -> Params:
             v_y = jnp.zeros((T, L))
         case DefaultPosition.PosTest:
             L, T = 2, 4
-            noise_std = 0.0
+            snr_ratio = 0.0
             p_x = jnp.array([[0.0, 1000.0], [300.0, 1300.0], [600.0, 1600.0], [900.0, 1900.0]])
             p_y = jnp.zeros((T, L))
             v_x = jnp.full((T, L), 300.0, dtype=jnp.float32)
@@ -132,7 +132,7 @@ def init_position(position: DefaultPosition) -> Params:
         seed=SEED,
         num_receivers=L, num_timesteps=T, num_samples_per_interval=N,
         sample_rate=sample_rate,
-        noise_stddev=noise_std,
+        snr_ratio=snr_ratio,
         receivers_p=jnp.stack([p_x, p_y]),
         receivers_v=jnp.stack([v_x, v_y])
     )
@@ -155,12 +155,10 @@ def sin_signal(k: int, N: int) -> Float[Array, "k N"]:
     return jnp.sin(2 * jnp.pi * jnp.outer(k_vals, n_vals) / (k * N) + 0.5)
 
 def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[Array, "k n"]]) -> Complex[Array, "k l n"]:
-    key = jax.random.PRNGKey(params.seed)
     k, l, N = params.num_timesteps, params.num_receivers, params.num_samples_per_interval
 
     s: Float[Array, "k N"] = generate_signal(k, N)
-    b: Float[Array, "k l"] = jnp.ones((k, l))
-    w: Float[Array, "k l N"] = jax.random.normal(key, (k, l, N)) * params.noise_stddev
+    b: Complex[Array, "k l"] = params.channel_attenuation * jnp.exp(1j * params.channel_phase * jnp.ones((k, l)))
 
     mu: Float[Array, "k l"] = calculate_mu(
         params.emitter, params.receivers_p, params.receivers_v,
@@ -173,7 +171,17 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
     A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
     C: Complex[Array, "k n"] = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', params.transmitted_freq_shifts, exps))
 
-    return (b[:, :, None] * A * C[:, None, :] * s[:, None, :]) + w
+    signal = (b[:, :, None] * A * C[:, None, :] * s[:, None, :])
+
+    params.rng, k2 = jax.random.split(params.rng)
+    signal_power = jnp.mean(jnp.abs(signal) ** 2)
+    noise_variance = signal_power / (10 ** (params.snr_ratio / 10))
+    noise_stddev = jnp.sqrt(noise_variance)
+
+    w = jax.random.normal(k2, shape=(2, k, l, N)) * noise_stddev / 2
+    w = w[0] + w[1] * 1.0j
+
+    return signal + w
 
 @jax.jit
 def compute_cost_dd(
