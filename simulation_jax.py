@@ -179,28 +179,19 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
     
     return (b[:, :, None] * A * C[:, None, :] * s[:, None, :]) + w
 
-# --- Optimized Estimation Kernels ---
-
 @jax.jit
 def compute_cost_unknown(p_x, p_y, signal, exps, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y):
-    # Unknown signal: Uses eigenvalues of the covariance matrix
     mu = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
     
     A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
     V = jnp.conj(A) * signal
-    
-    # Compute Q matrices [K, L, L] by contracting over N
-    # This is fast for small L
     Q_k = jnp.einsum('kln,kmn->klm', V, jnp.conj(V))
     
-    # Sum of max eigenvalues over timesteps K
     eigvals = jnp.linalg.eigvalsh(Q_k)
     return jnp.sum(eigvals[:, -1]).real
 
 @jax.jit
 def compute_cost_known(p_x, p_y, signal, prior_signal, exps, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y):
-    # Known signal: Uses FFT-based correlation (Wiener-Khinchin Theorem)
-    # O(N log N) instead of O(N^2)
     mu = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
     
     # Demodulate Doppler shift
@@ -239,17 +230,10 @@ def estimate_direct_position(
 
     T_s = 100.0 / 10000.0
     exps = jnp.arange(params.num_samples_per_interval) * T_s
-
-    # 3. Execution with Batching via jax.lax.map
-    # Instead of Python looping, we map the function over indices directly on device.
-    # Chunking is handled automatically by map/scan logic usually, but if VRAM is tight,
-    # we can reshape to explicit batches. 
     
-    print(f"Computing cost for {num_points} grid points (Optimized FFT)...")
-    
-    # We reshape to batches to prevent XLA from unrolling everything into one massive graph
+    # we reshape to batches to prevent XLA from unrolling everything into one massive graph
     # if the grid is huge. 1024 is a safe batch size for GPU.
-    batch_size = 4096
+    batch_size = 1024
     pad = (batch_size - (num_points % batch_size)) % batch_size
     total_padded = num_points + pad
     
