@@ -6,7 +6,7 @@ from typing import Optional, Callable, Tuple
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float, Complex
+from jaxtyping import Float, Complex, Int
 import pandas as pd
 import plotnine as p9
 
@@ -27,8 +27,10 @@ class Params:
     num_receivers: int
     num_timesteps: int
     num_samples_per_interval: int
+    sample_rate: int
+
     noise_stddev: float
-    
+
     # JAX Arrays (Unitless SI)
     receivers_p_x: Float[Array, "timesteps receivers"]
     receivers_p_y: Float[Array, "timesteps receivers"]
@@ -89,7 +91,8 @@ class DefaultPosition(enum.StrEnum):
 
 def init_position(position: DefaultPosition) -> Params:
     noise_std = 1.0
-    
+    sample_rate = 10_000
+
     match position:
         case DefaultPosition.PosA:
             L, T = 2, 10
@@ -128,6 +131,7 @@ def init_position(position: DefaultPosition) -> Params:
     return Params(
         seed=SEED,
         num_receivers=L, num_timesteps=T, num_samples_per_interval=N,
+        sample_rate=sample_rate,
         noise_stddev=noise_std,
         receivers_p_x=p_x,
         receivers_p_y=p_y,
@@ -156,10 +160,10 @@ def sin_signal(k: int, N: int) -> Float[Array, "k N"]:
     n_vals = jnp.arange(N)
     return jnp.sin(2 * jnp.pi * jnp.outer(k_vals, n_vals) / (k * N) + 0.5)
 
-def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[Array, "k n"]]) -> Array:
+def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[Array, "k n"]]) -> Complex[Array, "k l n"]:
     key = jax.random.PRNGKey(params.seed)
     k, l, N = params.num_timesteps, params.num_receivers, params.num_samples_per_interval
-    
+
     s: Float[Array, "k N"] = generate_signal(k, N)
     b: Float[Array, "k l"] = jnp.ones((k, l))
     w: Float[Array, "k l N"] = jax.random.normal(key, (k, l, N)) * params.noise_stddev
@@ -171,56 +175,90 @@ def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[
         PROPOGATION_SPEED_VAL
     )
 
-    T_s = 100.0 / 10000.0 
-    exps = jnp.arange(N) * T_s
+    T_s = params.num_samples_per_interval / params.sample_rate
+    exps: Float[Array, "N"] = jnp.arange(params.num_samples_per_interval) * T_s
 
-    A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
-    C = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', params.transmitted_freq_shifts, exps))
-    
+    A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
+    C: Complex[Array, "k n"] = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', params.transmitted_freq_shifts, exps))
+
     return (b[:, :, None] * A * C[:, None, :] * s[:, None, :]) + w
 
 @jax.jit
-def compute_cost_unknown(p_x, p_y, signal, exps, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y):
-    mu = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
-    
-    A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
-    V = jnp.conj(A) * signal
-    Q_k = jnp.einsum('kln,kmn->klm', V, jnp.conj(V))
-    
-    eigvals = jnp.linalg.eigvalsh(Q_k)
-    return jnp.sum(eigvals[:, -1]).real
+def compute_cost_unknown(
+        p_x: Float[Array, "1"],
+        p_y: Float[Array, "1"],
+        signal: Complex[Array, "k l n"],
+        exps: Float[Array, "n"],
+        receivers_p_x: Float[Array, "k l"],
+        receivers_p_y: Float[Array, "k l"],
+        receivers_v_x: Float[Array, "k l"],
+        receivers_v_y: Float[Array, "k l"]
+) -> Float[Array, "1"]:
+    mu: Float[Array, "k l"] = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
+
+    A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
+    V: Complex[Array, "k l n"] = jnp.conj(A) * signal
+    # We take VV^H, instead of V^HV, to reduce computation
+    Q: Complex[Array, "k l l"] = jnp.einsum('kln,kmn->klm', V, jnp.conj(V))
+
+    # since the matrix is hermitian, we will always get real eigenvalues
+    cost: Float[Array, "k"] = jnp.linalg.eigvalsh(Q)[:, -1]
+    return jnp.sum(cost)
 
 @jax.jit
-def compute_cost_known(p_x, p_y, signal, prior_signal, exps, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y):
-    mu = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
-    
-    # Demodulate Doppler shift
-    A = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
-    
-    # V: [K, L, N] - Signal compensated for position-dependent Doppler
-    V = jnp.conj(A) * signal
-    
-    # B: [K, L, N] - Match with prior signal
-    B = V * prior_signal[:, None, :]
-    
+def compute_cost_known(
+        p_x: Float[Array, "1"],
+        p_y: Float[Array, "1"],
+        signal: Complex[Array, "k l n"],
+        prior_signal: Complex[Array, "k n"],
+        exps: Float[Array, "n"],
+        receivers_p_x: Float[Array, "k l"],
+        receivers_p_y: Float[Array, "k l"],
+        receivers_v_x: Float[Array, "k l"],
+        receivers_v_y: Float[Array, "k l"]
+) -> Float[Array, "1"]:
+    mu: Float[Array, "k l"] = calculate_mu(p_x, p_y, receivers_p_x, receivers_p_y, receivers_v_x, receivers_v_y, PROPOGATION_SPEED_VAL)
+
+    A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
+    V: Complex[Array, "k l n"] = jnp.conj(A) * signal
+    # correlation with prior
+    B: Complex[Array, "k l n"] = V * prior_signal[:, None, :]
+
+    # G = jnp.einsum('kli,klj->kij', jnp.conj(B), B)
+
+    # def get_diag_sum(m):
+    #     return jnp.trace(G, offset=m, axis1=1, axis2=2)
+
+
+    # N = G.shape[-1]
+    # alpha = jax.vmap(get_diag_sum)(jnp.arange(N)).T
+
+    # mask = jnp.ones(N)
+    # mask = mask.at[1:].set(2.0)
+    # beta = alpha * mask[None, :]
+
+    # fft_out = jnp.fft.fft(jnp.conj(beta), n=N, axis=1)
+    # return jnp.sum(jnp.max(jnp.real(fft_out), axis=1))
+
     # Calculate energy at different time-lags via FFT
     # FFT of Autocorrelation = |FFT(Signal)|^2 (Power Spectral Density)
     # This replaces the O(N^2) matrix construction
-    B_fft = jnp.fft.fft(B, axis=2)
-    psd = jnp.real(B_fft * jnp.conj(B_fft))
-    
-    # Sum energy across receivers [K, L, N] -> [K, N]
-    psd_sum = jnp.sum(psd, axis=1)
-    
+    B_fft: Complex[Array, "k l n"] = jnp.fft.fft(B, axis=2)
+    psd: Float[Array, "k l n"] = jnp.real(B_fft * jnp.conj(B_fft))
+
+    # Sum energy across receivers
+    psd_sum: Float[Array, "k n"] = jnp.sum(psd, axis=1)
+
     # Find peak energy (best lag) for each timestep and sum
     return jnp.sum(jnp.max(psd_sum, axis=1))
 
+CostFn = Callable[[Float[Array, "N_batch"], Float[Array, "N_batch"]], Float[Array, "1"]]
 def estimate_direct_position(
-    params: Params, 
-    signal: Array, 
-    p_min: float, 
-    p_max: float, 
-    p_step: float, 
+    params: Params,
+    signal: Array,
+    p_min: float,
+    p_max: float,
+    p_step: float,
     generate_prior_signal: Optional[Callable] = None
 ) -> tuple[tuple[Float[Array, "1"], Float[Array, "1"]], dict[str, Float[Array, "N"]]]:
     grid = jnp.mgrid[p_min:p_max:p_step, p_min:p_max:p_step].reshape(2, -1)
@@ -228,53 +266,52 @@ def estimate_direct_position(
     flat_ys = grid[1, :]
     num_points = flat_xs.shape[0]
 
-    T_s = 100.0 / 10000.0
-    exps = jnp.arange(params.num_samples_per_interval) * T_s
-    
+    T_s = params.num_samples_per_interval / params.sample_rate
+    exps: Float[Array, "N"] = jnp.arange(params.num_samples_per_interval) * T_s
+
     # we reshape to batches to prevent XLA from unrolling everything into one massive graph
     # if the grid is huge. 1024 is a safe batch size for GPU.
     batch_size = 1024
     pad = (batch_size - (num_points % batch_size)) % batch_size
     total_padded = num_points + pad
-    
+
     # Pad inputs to divisible size
-    xs_padded = jnp.pad(flat_xs, (0, pad))
-    ys_padded = jnp.pad(flat_ys, (0, pad))
-    
+    xs_padded: Float[Array, "Np"] = jnp.pad(flat_xs, (0, pad))
+    ys_padded: Float[Array, "Np"] = jnp.pad(flat_ys, (0, pad))
+
     # Reshape to [num_batches, batch_size]
-    xs_batched = xs_padded.reshape(-1, batch_size)
-    ys_batched = ys_padded.reshape(-1, batch_size)
+    xs_batched: Float[Array, "N_batch batch"] = xs_padded.reshape(-1, batch_size)
+    ys_batched: Float[Array, "N_batch batch"] = ys_padded.reshape(-1, batch_size)
 
-    # Run loop on device using lax.map
+
+    if generate_prior_signal is None:
+        cost_fn: CostFn = jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+    else:
+        prior: Float[Array, "k n"]  = generate_prior_signal(params.num_timesteps, params.num_samples_per_interval)
+        cost_fn = jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))
+
     def run_batch(idx_batch: int):
-        # We actually need to pass the coordinates, scan_fn above used global flat_xs reference
-        # Let's redefine to be cleaner
-        b_xs = xs_batched[idx_batch]
-        b_ys = ys_batched[idx_batch]
-        if generate_prior_signal is None:
-            return jax.vmap(lambda x, y: compute_cost_unknown(x, y, signal, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))(b_xs, b_ys)
-        else:
-            prior = generate_prior_signal(params.num_timesteps, params.num_samples_per_interval)
-            return jax.vmap(lambda x, y: compute_cost_known(x, y, signal, prior, exps, params.receivers_p_x, params.receivers_p_y, params.receivers_v_x, params.receivers_v_y))(b_xs, b_ys)
+        b_xs: Float[Array, "N_batch"] = xs_batched[idx_batch]
+        b_ys: Float[Array, "N_batch"] = ys_batched[idx_batch]
 
-    # Use jax.lax.map to loop over batches
-    # range is just indices 0..num_batches
-    batch_indices = jnp.arange(xs_batched.shape[0])
+        # note: cost_fn is a vmap
+        return cost_fn(b_xs, b_ys)
+
+    batch_indices: Int[Array, "N_batch"] = jnp.arange(xs_batched.shape[0])
     costs_batched = jax.lax.map(run_batch, batch_indices)
-    
-    # Flatten and slice off padding
-    costs = costs_batched.flatten()[:num_points]
-    
-    max_idx = jnp.argmax(costs)
-    best_x = flat_xs[max_idx]
-    best_y = flat_ys[max_idx]
+
+    costs: Float[Array, "N_batch batch"] = costs_batched.flatten()[:num_points]
+
+    max_idx: Int[Array, "1"] = jnp.argmax(costs)
+    best_x: Float[Array, "best"] = flat_xs[max_idx]
+    best_y: Float[Array, "best"] = flat_ys[max_idx]
 
     data = {
         "xs": flat_xs,
         "ys": flat_ys,
         "cost": costs
     }
-    
+
     return (best_x, best_y), data
 
 if __name__ == '__main__':
@@ -284,23 +321,23 @@ if __name__ == '__main__':
             print(f"\n--- Simulation: {pos} ---")
             params = init_position(pos)
             print(f"Emitter Actual: ({params.emitter_x:.2f}, {params.emitter_y:.2f})")
-            
+
             signal = simulate_signal(params, sin_signal)
-            
+
             start = time.time()
             estimate, data = estimate_direct_position(
-                params, 
-                signal, 
-                0.0, 
-                10_000.0, 
+                params,
+                signal,
+                0.0,
+                10_000.0,
                 100.0, # 100x100 grid
-                generate_prior_signal=sin_signal
+                # generate_prior_signal=sin_signal
             )
             end = time.time()
-            
+
             est_x, est_y = estimate
             print(f"Estimate: ({est_x:.2f}, {est_y:.2f})")
-            err = np.sqrt((params.emitter_x - est_x)**2 + (params.emitter_y - est_y)**2)
+            err = jnp.sqrt((params.emitter_x - est_x)**2 + (params.emitter_y - est_y)**2)
 
             data = pd.DataFrame(data)
             (
@@ -311,7 +348,6 @@ if __name__ == '__main__':
                 + p9.geom_vline(xintercept=est_x, linetype="dotted")
                 + p9.geom_hline(yintercept=est_y, linetype="dotted")
                 + p9.theme_minimal()
-            ).save(f'jax_plots/__{idx}_{SEED}.png', dpi=300, width=5, height=5)
-            
-            print(f"Error: {err:.2f} m (Computed in {end-start:.2f}s)")
-        break
+            ).save(f'jax_plots/{idx}_{SEED}.png', dpi=300, width=5, height=5)
+
+            print(f"Error: {err:.2f} m (Computed in {(end-start) * 1000:.3f}ms)")
