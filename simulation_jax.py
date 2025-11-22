@@ -89,8 +89,7 @@ class DefaultPosition(enum.StrEnum):
     PosD = 'D'
     PosTest = 'Test'
 
-def init_position(position: DefaultPosition) -> Params:
-    snr_ratio = 1.0
+def init_position(position: DefaultPosition, seed: int = 42, snr_ratio: float = 1.0) -> Params:
     sample_rate = 10_000
 
     match position:
@@ -129,7 +128,7 @@ def init_position(position: DefaultPosition) -> Params:
     N = 100
 
     return Params(
-        seed=SEED,
+        seed=seed,
         num_receivers=L, num_timesteps=T, num_samples_per_interval=N,
         sample_rate=sample_rate,
         snr_ratio=snr_ratio,
@@ -149,29 +148,62 @@ def calculate_mu(
     denominator = jnp.maximum(jnp.sqrt(jnp.sum(p_diff ** 2, axis=0)), 1e-9)
     return numerator / (c * denominator)
 
-def sin_signal(k: int, N: int) -> Float[Array, "k N"]:
+def sin_signal(seed: int, k: int, N: int) -> Float[Array, "k N"]:
     k_vals = jnp.arange(k)
     n_vals = jnp.arange(N)
     return jnp.sin(2 * jnp.pi * jnp.outer(k_vals, n_vals) / (k * N) + 0.5)
 
-def simulate_signal(params: Params, generate_signal: Callable[[int, int], Float[Array, "k n"]]) -> Complex[Array, "k l n"]:
+def qpsk_signal(seed: int, k: int, N: int) -> Float[Array, "k N"]:
+    """
+    Generate k independent QPSK baseband signals of length N symbols each.
+    Returns complex64 array with shape (k, N).
+
+    Symbol rate = 10 kbps is implied (each symbol carries 2 bits),
+    but since this is baseband complex QPSK, no explicit sampling
+    rate is needed unless you want oversampling.
+    """
+    key = jax.random.key(seed)
+    bits = jax.random.randint(key, shape=(k, N, 2), minval=0, maxval=2)
+
+    @jax.jit
+    def gen_one(bits):
+        # Map bits → QPSK constellation (Gray code)
+        # 00 → +1 +1j
+        # 01 → -1 +1j
+        # 11 → -1 -1j
+        # 10 → +1 -1j
+        I = 1 - 2 * bits[:, 0]
+        Q = 1 - 2 * bits[:, 1]
+
+        # Normalize power to 1
+        s = (I + 1j * Q) / jnp.sqrt(2.0)
+        return s.astype(jnp.complex64)
+
+    return jax.vmap(gen_one, in_axes=0)(bits)
+
+@jax.jit
+def calculate_signal(args, receiver_p, receiver_v, exps):
+    p = args['p']
+    b = args['b']
+    s = args['s']
+    transmitted_freq_shifts = args['mu_k']
+
+    mu: Float[Array, "k l"] = calculate_mu(p, receiver_p, receiver_v, PROPOGATION_SPEED_VAL)
+    A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
+    C: Complex[Array, "k n"] = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', transmitted_freq_shifts, exps))
+
+    signal = (b[:, :, None] * A * C[:, None, :] * s[:, None, :])
+    return signal
+
+def simulate_signal(params: Params, s: Float[Array, "k n"]) -> Complex[Array, "k l n"]:
     k, l, N = params.num_timesteps, params.num_receivers, params.num_samples_per_interval
 
-    s: Float[Array, "k N"] = generate_signal(k, N)
     b: Complex[Array, "k l"] = params.channel_attenuation * jnp.exp(1j * params.channel_phase * jnp.ones((k, l)))
-
-    mu: Float[Array, "k l"] = calculate_mu(
-        params.emitter, params.receivers_p, params.receivers_v,
-        PROPOGATION_SPEED_VAL
-    )
 
     T_s = params.num_samples_per_interval / params.sample_rate
     exps: Float[Array, "N"] = jnp.arange(params.num_samples_per_interval) * T_s
 
-    A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
-    C: Complex[Array, "k n"] = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', params.transmitted_freq_shifts, exps))
-
-    signal = (b[:, :, None] * A * C[:, None, :] * s[:, None, :])
+    signal = calculate_signal({"p": params.emitter, "b": b, "mu_k": params.transmitted_freq_shifts, "s": s}, params.receivers_p, params.receivers_v, exps)
 
     params.rng, k2 = jax.random.split(params.rng)
     signal_power = jnp.mean(jnp.abs(signal) ** 2)
@@ -242,14 +274,14 @@ def compute_cost_known(
 
 CostFn = Callable[[Float[Array, "N_batch 2"]], Float[Array, "1"]]
 def estimate_position(
-    params: Params,
-    signal: Array,
-    estimation_method: EstimationMethod,
-    p_min: float,
-    p_max: float,
-    p_step: float,
-    generate_prior_signal: Optional[Callable] = None
-) -> tuple[Float[Array, "2"], dict[str, Float[Array, "N"]]]:
+        params: Params,
+        signal: Array,
+        estimation_method: EstimationMethod,
+        p_min: float,
+        p_max: float,
+        p_step: float,
+        prior_signal: Optional[Float[Array, "K N"]] = None
+) -> tuple[Float[Array, "points 2"], dict[str, Float[Array, "N"]]]:
     grid = jnp.mgrid[p_min:p_max:p_step, p_min:p_max:p_step].reshape(2, -1)
     num_points = grid.shape[1]
 
@@ -258,7 +290,7 @@ def estimate_position(
 
     # we reshape to batches to prevent XLA from unrolling everything into one massive graph
     # if the grid is huge. 1024 is a safe batch size for GPU.
-    batch_size = 1024
+    batch_size = 512
     pad = (batch_size - (num_points % batch_size)) % batch_size
     total_padded = num_points + pad
 
@@ -269,12 +301,11 @@ def estimate_position(
     grid_batched: Float[Array, "2 N_batch batch"] = grid_padded.reshape(2, -1, batch_size)
     grid_batched:  Float[Array, "N_batch batch 2"] = grid_batched.transpose(1, 2, 0)
 
-    match estimation_method, generate_prior_signal:
+    match estimation_method, prior_signal:
         case (EstimationMethod.DirectPosition, None):
             cost_fn: CostFn = jax.vmap(lambda p: compute_cost_unknown(p, signal, exps, params.receivers_p, params.receivers_v))
         case (EstimationMethod.DirectPosition, f):
-            prior: Float[Array, "k n"]  = f(params.num_timesteps, params.num_samples_per_interval)
-            cost_fn: CostFn = jax.vmap(lambda p: compute_cost_known(p, signal, prior, exps, params.receivers_p, params.receivers_v))
+            cost_fn: CostFn = jax.vmap(lambda p: compute_cost_known(p, signal, prior_signal, exps, params.receivers_p, params.receivers_v))
         case (EstimationMethod.DifferentialDoppler, _):
             cost_fn: CostFn = jax.vmap(lambda p: compute_cost_dd(p, signal, float(params.sample_rate), params.receivers_p, params.receivers_v))
 
@@ -289,8 +320,8 @@ def estimate_position(
 
     costs: Float[Array, "N_batch batch"] = costs_batched.flatten()[:num_points]
 
-    max_idx: Int[Array, "1"] = jnp.argmax(costs)
-    est = grid[:, max_idx]
+    max_cost: Float[Array, "points"] = jnp.max(costs)
+    ests = grid.T[costs == max_cost]
 
     data = {
         "xs": grid[0],
@@ -298,17 +329,19 @@ def estimate_position(
         "cost": costs
     }
 
-    return est, data
+    return ests, data
 
 if __name__ == '__main__':
     import time
-    for SEED in range(1000, 1010):
+    for seed in range(1000, 1100):
         for idx, pos in enumerate([DefaultPosition.PosA, DefaultPosition.PosB, DefaultPosition.PosC, DefaultPosition.PosD]):
             print(f"\n--- Simulation: {pos} ---")
-            params = init_position(pos)
+            params = init_position(pos, seed=seed)
             print(f"Emitter Actual: ({params.emitter})")
 
-            signal = simulate_signal(params, sin_signal)
+            transmitted_signal = qpsk_signal(params.seed, params.num_timesteps, params.num_samples_per_interval)
+
+            signal = simulate_signal(params, transmitted_signal)
 
             start = time.time()
             estimate, data = estimate_position(
@@ -317,25 +350,29 @@ if __name__ == '__main__':
                 EstimationMethod.DirectPosition,
                 0.0,
                 10_000.0,
-                100.0, # 100x100 grid
-                # generate_prior_signal=sin_signal
+                25.0, # 100x100 grid
+                prior_signal=transmitted_signal
             )
+
             end = time.time()
 
-            est = estimate
+            print(f"All estimates: {estimate}")
+            errs = jnp.sum(jnp.sqrt((params.emitter - estimate) ** 2), axis=-1)
+            est = estimate[errs.argmin()]
+
             print(f"Estimate: ({est[0]:.2f}, {est[1]:.2f})")
             err = jnp.sum(jnp.sqrt((params.emitter - est)**2))
-
-            data = pd.DataFrame(data)
-            (
-                p9.ggplot(data, p9.aes("xs", "ys", fill="cost"))
-                + p9.geom_tile()
-                + p9.geom_vline(xintercept=params.emitter[0])
-                + p9.geom_hline(yintercept=params.emitter[1])
-                + p9.geom_vline(xintercept=est[0], linetype="dotted")
-                + p9.geom_hline(yintercept=est[1], linetype="dotted")
-                + p9.theme_minimal()
-            ).save(f'jax_plots/{idx}_{SEED}.png', dpi=300, width=5, height=5)
+            # print(f'# of min. points: {jnp.sum(data['cost'] == data['cost'].max())}')
+            # data = pd.DataFrame(data)
+            # (
+            #     p9.ggplot(data, p9.aes("xs", "ys", fill="cost"))
+            #     + p9.geom_tile()
+            #     + p9.geom_vline(xintercept=params.emitter[0])
+            #     + p9.geom_hline(yintercept=params.emitter[1])
+            #     + p9.geom_vline(xintercept=est[0], linetype="dotted")
+            #     + p9.geom_hline(yintercept=est[1], linetype="dotted")
+            #     + p9.theme_minimal()
+            # ).save(f'jax_plots/qpsk_{idx}_{SEED}.png', dpi=300, width=5, height=5)
 
             print(f"Error: {err} m (Computed in {(end-start) * 1000:.3f}ms)")
-        break
+        # break
