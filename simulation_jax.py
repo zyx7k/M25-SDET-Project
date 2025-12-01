@@ -12,6 +12,11 @@ import plotnine as p9
 
 # jax.config.update("jax_enable_x64", True)
 
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_kernel_cache_file")
+
 SEED = 42
 
 # Physical Constants
@@ -125,15 +130,15 @@ def init_position(position: DefaultPosition, seed: int = 42, snr_ratio: float = 
             v_x = jnp.full((T, L), 300.0, dtype=jnp.float32)
             v_y = jnp.zeros((T, L))
 
-    N = 100
+    N = 128
 
     return Params(
         seed=seed,
         num_receivers=L, num_timesteps=T, num_samples_per_interval=N,
         sample_rate=sample_rate,
         snr_ratio=snr_ratio,
-        receivers_p=jnp.stack([p_x, p_y]),
-        receivers_v=jnp.stack([v_x, v_y])
+        receivers_p=jnp.stack([p_x, p_y], dtype=jnp.float32),
+        receivers_v=jnp.stack([v_x, v_y], dtype=jnp.float32)
     )
 
 @jax.jit
@@ -149,9 +154,13 @@ def calculate_mu(
     return numerator / (c * denominator)
 
 def sin_signal(seed: int, k: int, N: int) -> Float[Array, "k N"]:
-    k_vals = jnp.arange(k)
-    n_vals = jnp.arange(N)
-    return jnp.sin(2 * jnp.pi * jnp.outer(k_vals, n_vals) / (k * N) + 0.5)
+    key = jax.random.key(seed)
+    bits = jax.random.uniform(key, shape=(k, N), minval=-jnp.pi, maxval=jnp.pi)
+    return jnp.sin(2 * bits / (k * N) + 0.5)
+
+    # k_vals = jnp.arange(k)
+    # n_vals = jnp.arange(N)
+    # return jnp.sin(2 * jnp.pi * jnp.outer(k_vals, n_vals) / (k * N) + 0.5)
 
 def qpsk_signal(seed: int, k: int, N: int) -> Float[Array, "k N"]:
     """
@@ -181,13 +190,7 @@ def qpsk_signal(seed: int, k: int, N: int) -> Float[Array, "k N"]:
 
     return jax.vmap(gen_one, in_axes=0)(bits)
 
-@jax.jit
-def calculate_signal(args, receiver_p, receiver_v, exps):
-    p = args['p']
-    b = args['b']
-    s = args['s']
-    transmitted_freq_shifts = args['mu_k']
-
+def calculate_signal(p, b, transmitted_freq_shifts, s, receiver_p, receiver_v, exps):
     mu: Float[Array, "k l"] = calculate_mu(p, receiver_p, receiver_v, PROPOGATION_SPEED_VAL)
     A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
     C: Complex[Array, "k n"] = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', transmitted_freq_shifts, exps))
@@ -203,7 +206,7 @@ def simulate_signal(params: Params, s: Float[Array, "k n"]) -> Complex[Array, "k
     T_s = params.num_samples_per_interval / params.sample_rate
     exps: Float[Array, "N"] = jnp.arange(params.num_samples_per_interval) * T_s
 
-    signal = calculate_signal({"p": params.emitter, "b": b, "mu_k": params.transmitted_freq_shifts, "s": s}, params.receivers_p, params.receivers_v, exps)
+    signal = calculate_signal(params.emitter, b, params.transmitted_freq_shifts, s, params.receivers_p, params.receivers_v, exps)
 
     params.rng, k2 = jax.random.split(params.rng)
     signal_power = jnp.mean(jnp.abs(signal) ** 2)
@@ -213,17 +216,70 @@ def simulate_signal(params: Params, s: Float[Array, "k n"]) -> Complex[Array, "k
     w = jax.random.normal(k2, shape=(2, k, l, N)) * noise_stddev / 2
     w = w[0] + w[1] * 1.0j
 
-    return signal + w
+    return (signal + w)
 
 @jax.jit
 def compute_cost_dd(
         p: Float[Array, "2"],
         signal: Complex[Array, "k l n"],
-        sample_rate: float,
+        exps: Float[Array, "n"],
         receivers_p: Float[Array, "2 k l"],
         receivers_v: Float[Array, "2 k l"]
 ) -> Float[Array, "1"]:
-    raise NotImplementedError("TODO")
+    """
+    Differential Doppler LS cost for candidate (p_x, p_y).
+
+    signal: shape (K, L, N) complex (timesteps, receivers, samples)
+    exps:   shape (N,) time vector for each sample in interval (seconds)
+    returns: scalar cost = sum_k |Δf_hat_k - f_c * Δm_k(p)|^2
+    """
+    # signal dims
+    K, L, N = signal.shape
+
+    # --- 1) estimate per-receiver instantaneous frequency using
+    #     phase-difference (autocorrelation) method
+    # compute sample period from exps (safe for GPU)
+    # if exps has length >= 2, dt = exps[1]-exps[0], else fallback to 1.0
+    dt = jnp.where(exps.shape[0] > 1, exps[1] - exps[0], 1.0)
+    sample_rate = 1.0 / dt
+
+    # product x[n+1] * conj(x[n]) across sample axis -> shape (K,L,N-1)
+    prod = signal[..., 1:] * jnp.conj(signal[..., :-1])
+    # sum across time samples to average phase increment -> shape (K,L)
+    sum_prod = jnp.sum(prod, axis=-1)
+    # unwrap phase estimate (angle of summed increment)
+    phase_inc = jnp.angle(sum_prod)  # radians
+    # frequency estimate per receiver, per timestep (Hz)
+    f_hat = (phase_inc / (2.0 * jnp.pi)) * sample_rate  # shape (K, L)
+
+    # --- 2) compute differential measured frequency Δf_hat_k
+    # Use receivers 0 and 1 by default (paper assumes two receivers)
+    # If L>2 and you want other pair, change indices here.
+    r1 = 0
+    r2 = 1
+    # safety: if L < 2, produce zeros to avoid indexing error
+    # However, normally L>=2 in your scenario
+    def safe_delta(f):
+        return jnp.where(L > 1, f[:, r2] - f[:, r1], jnp.zeros((K,)))
+    delta_f_hat = safe_delta(f_hat)  # shape (K,)
+
+    # --- 3) compute predicted differential Doppler term Δm_k(p) = μ_{r2} - μ_{r1}
+    mu = calculate_mu(
+        p,
+        receivers_p,
+        receivers_v,
+        PROPOGATION_SPEED_VAL
+    )  # shape (K, L)
+
+    # predicted Δf (Hz)
+    delta_m = mu[:, r2] - mu[:, r1]  # (K,)
+    pred_delta_f = NOMINAL_CARRIER_FREQUENCY_VAL * delta_m  # (K,)
+
+    # --- 4) LS cost (sum of squared errors over time-intervals k)
+    err = delta_f_hat - pred_delta_f
+    cost = jnp.sum(err * err)
+
+    return cost
 
 @jax.jit
 def compute_cost_unknown(
@@ -290,7 +346,7 @@ def estimate_position(
 
     # we reshape to batches to prevent XLA from unrolling everything into one massive graph
     # if the grid is huge. 1024 is a safe batch size for GPU.
-    batch_size = 512
+    batch_size = 64
     pad = (batch_size - (num_points % batch_size)) % batch_size
     total_padded = num_points + pad
 
@@ -307,16 +363,9 @@ def estimate_position(
         case (EstimationMethod.DirectPosition, f):
             cost_fn: CostFn = jax.vmap(lambda p: compute_cost_known(p, signal, prior_signal, exps, params.receivers_p, params.receivers_v))
         case (EstimationMethod.DifferentialDoppler, _):
-            cost_fn: CostFn = jax.vmap(lambda p: compute_cost_dd(p, signal, float(params.sample_rate), params.receivers_p, params.receivers_v))
+            cost_fn: CostFn = jax.vmap(lambda p: compute_cost_dd(p, signal, exps, params.receivers_p, params.receivers_v))
 
-    def run_batch(idx_batch: int):
-        batch: Float[Array, "N_batch"] = grid_batched[idx_batch]
-
-        # note: cost_fn is a vmap
-        return cost_fn(batch)
-
-    batch_indices: Int[Array, "N_batch"] = jnp.arange(grid_batched.shape[0])
-    costs_batched = jax.lax.map(run_batch, batch_indices)
+    costs_batched = jax.vmap(cost_fn)(grid_batched)
 
     costs: Float[Array, "N_batch batch"] = costs_batched.flatten()[:num_points]
 
@@ -333,7 +382,11 @@ def estimate_position(
 
 if __name__ == '__main__':
     import time
-    for seed in range(1000, 1100):
+
+    options = jax.profiler.ProfileOptions()
+    options.python_tracer_level = 1
+    # jax.profiler.start_trace("/tmp/jax-trace", profiler_options=options)
+    for seed in range(1000, 1010):
         for idx, pos in enumerate([DefaultPosition.PosA, DefaultPosition.PosB, DefaultPosition.PosC, DefaultPosition.PosD]):
             print(f"\n--- Simulation: {pos} ---")
             params = init_position(pos, seed=seed)
@@ -347,10 +400,10 @@ if __name__ == '__main__':
             estimate, data = estimate_position(
                 params,
                 signal,
-                EstimationMethod.DirectPosition,
+                EstimationMethod.DifferentialDoppler,
                 0.0,
                 10_000.0,
-                25.0, # 100x100 grid
+                50.0, # 100x100 grid
                 prior_signal=transmitted_signal
             )
 
@@ -362,17 +415,18 @@ if __name__ == '__main__':
 
             print(f"Estimate: ({est[0]:.2f}, {est[1]:.2f})")
             err = jnp.sum(jnp.sqrt((params.emitter - est)**2))
-            # print(f'# of min. points: {jnp.sum(data['cost'] == data['cost'].max())}')
-            # data = pd.DataFrame(data)
-            # (
-            #     p9.ggplot(data, p9.aes("xs", "ys", fill="cost"))
-            #     + p9.geom_tile()
-            #     + p9.geom_vline(xintercept=params.emitter[0])
-            #     + p9.geom_hline(yintercept=params.emitter[1])
-            #     + p9.geom_vline(xintercept=est[0], linetype="dotted")
-            #     + p9.geom_hline(yintercept=est[1], linetype="dotted")
-            #     + p9.theme_minimal()
-            # ).save(f'jax_plots/qpsk_{idx}_{SEED}.png', dpi=300, width=5, height=5)
+            print(f'# of min. points: {jnp.sum(data['cost'] == data['cost'].max())}')
+            data = pd.DataFrame(data)
+            (
+                p9.ggplot(data, p9.aes("xs", "ys", fill="cost"))
+                + p9.geom_tile()
+                + p9.geom_vline(xintercept=params.emitter[0])
+                + p9.geom_hline(yintercept=params.emitter[1])
+                + p9.geom_vline(xintercept=est[0], linetype="dotted")
+                + p9.geom_hline(yintercept=est[1], linetype="dotted")
+                + p9.theme_minimal()
+            ).save(f'jax_plots/dd_qpsk_{idx}_{params.seed}.png', dpi=300, width=5, height=5)
 
             print(f"Error: {err} m (Computed in {(end-start) * 1000:.3f}ms)")
-        # break
+            # break
+    # jax.profiler.stop_trace()
