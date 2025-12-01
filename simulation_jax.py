@@ -226,60 +226,28 @@ def compute_cost_dd(
         receivers_p: Float[Array, "2 k l"],
         receivers_v: Float[Array, "2 k l"]
 ) -> Float[Array, "1"]:
-    """
-    Differential Doppler LS cost for candidate (p_x, p_y).
-
-    signal: shape (K, L, N) complex (timesteps, receivers, samples)
-    exps:   shape (N,) time vector for each sample in interval (seconds)
-    returns: scalar cost = sum_k |Δf_hat_k - f_c * Δm_k(p)|^2
-    """
-    # signal dims
-    K, L, N = signal.shape
-
-    # --- 1) estimate per-receiver instantaneous frequency using
-    #     phase-difference (autocorrelation) method
-    # compute sample period from exps (safe for GPU)
-    # if exps has length >= 2, dt = exps[1]-exps[0], else fallback to 1.0
-    dt = jnp.where(exps.shape[0] > 1, exps[1] - exps[0], 1.0)
-    sample_rate = 1.0 / dt
-
-    # product x[n+1] * conj(x[n]) across sample axis -> shape (K,L,N-1)
-    prod = signal[..., 1:] * jnp.conj(signal[..., :-1])
-    # sum across time samples to average phase increment -> shape (K,L)
-    sum_prod = jnp.sum(prod, axis=-1)
-    # unwrap phase estimate (angle of summed increment)
-    phase_inc = jnp.angle(sum_prod)  # radians
-    # frequency estimate per receiver, per timestep (Hz)
-    f_hat = (phase_inc / (2.0 * jnp.pi)) * sample_rate  # shape (K, L)
-
-    # --- 2) compute differential measured frequency Δf_hat_k
-    # Use receivers 0 and 1 by default (paper assumes two receivers)
-    # If L>2 and you want other pair, change indices here.
+    # todo: replace the 0/1s with all signals?
     r1 = 0
     r2 = 1
-    # safety: if L < 2, produce zeros to avoid indexing error
-    # However, normally L>=2 in your scenario
-    def safe_delta(f):
-        return jnp.where(L > 1, f[:, r2] - f[:, r1], jnp.zeros((K,)))
-    delta_f_hat = safe_delta(f_hat)  # shape (K,)
 
-    # --- 3) compute predicted differential Doppler term Δm_k(p) = μ_{r2} - μ_{r1}
-    mu = calculate_mu(
-        p,
-        receivers_p,
-        receivers_v,
-        PROPOGATION_SPEED_VAL
-    )  # shape (K, L)
+    dt = exps[1] - exps[0]
+    N = exps.shape[0]
 
-    # predicted Δf (Hz)
-    delta_m = mu[:, r2] - mu[:, r1]  # (K,)
-    pred_delta_f = NOMINAL_CARRIER_FREQUENCY_VAL * delta_m  # (K,)
+    S1: Float[Array, "k N"] = jnp.fft.fft(signal[:, r1, :], axis=-1)
+    S2: Float[Array, "k N"] = jnp.fft.fft(signal[:, r2, :], axis=-1)
+    cross_spec: Float[Array, "k N"] = S1 * jnp.conj(S2)
 
-    # --- 4) LS cost (sum of squared errors over time-intervals k)
-    err = delta_f_hat - pred_delta_f
-    cost = jnp.sum(err * err)
+    mag: Float[Array, "k N"] = jnp.abs(cross_spec)
+    peak_idx: Float[Array, "k"] = jnp.argmax(mag, axis=-1)
+    freqs: Float[Array, "N"] = jnp.fft.fftfreq(N, d=dt)
+    f_peak: Float[Array, "k"] = freqs[peak_idx]
 
-    return cost
+    mu: Float[Array, "k l"] = calculate_mu(p, receivers_p, receivers_v, PROPOGATION_SPEED_VAL)
+    pred_delta_f: Float[Array, "k"] = NOMINAL_CARRIER_FREQUENCY_VAL * (mu[:, r1] - mu[:, r2])
+
+    err: Float[Array, "k"] = jnp.real(f_peak) - pred_delta_f
+    cost = jnp.sum(err ** 2)
+    return -cost
 
 @jax.jit
 def compute_cost_unknown(
@@ -365,7 +333,7 @@ def estimate_position(
         case (EstimationMethod.DifferentialDoppler, _):
             cost_fn: CostFn = jax.vmap(lambda p: compute_cost_dd(p, signal, exps, params.receivers_p, params.receivers_v))
 
-    costs_batched = jax.vmap(cost_fn)(grid_batched)
+    costs_batched = jax.lax.map(cost_fn, grid_batched)
 
     costs: Float[Array, "N_batch batch"] = costs_batched.flatten()[:num_points]
 
@@ -403,7 +371,7 @@ if __name__ == '__main__':
                 EstimationMethod.DifferentialDoppler,
                 0.0,
                 10_000.0,
-                50.0, # 100x100 grid
+                100.0, # 100x100 grid
                 prior_signal=transmitted_signal
             )
 
@@ -429,4 +397,5 @@ if __name__ == '__main__':
 
             print(f"Error: {err} m (Computed in {(end-start) * 1000:.3f}ms)")
             # break
+        # break
     # jax.profiler.stop_trace()
