@@ -1,16 +1,17 @@
 import sys
 import enum
-from dataclasses import dataclass, field
-from typing import Optional, Callable, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Optional, Callable, Tuple, Self
 
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 from jax import Array
 from jaxtyping import Float, Complex, Int
 import pandas as pd
 import plotnine as p9
 
-# jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", True)
 
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -28,6 +29,7 @@ class EstimationMethod(enum.StrEnum):
     DirectPosition = "DPD"
     DifferentialDoppler = "DD"
 
+@jax.tree_util.register_pytree_node_class
 @dataclass
 class Params:
     seed: int
@@ -86,6 +88,64 @@ class Params:
 
         self.timesteps = jnp.max(timesteps, axis=0)
 
+    # jax utility functions for easy grad calculation
+    def tree_flatten(self):
+        children = (self.emitter, self.transmitted_freq_shifts, self.channel_attenuation, self.channel_phase)
+        aux = (self.seed, self.rng, self.num_receivers, self.num_samples_per_interval, self.num_timesteps, self.sample_rate, self.snr_ratio, self.receivers_p, self.receivers_v, self.timesteps)
+
+        return children, aux
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        (
+            emitter,
+            transmitted_freq_shifts,
+            channel_attenuation,
+            channel_phase,
+        ) = children
+        (
+            seed,
+            rng,
+            num_receivers,
+            num_samples_per_interval,
+            num_timesteps,
+            sample_rate,
+            snr_ratio,
+            receivers_p,
+            receivers_v,
+            timesteps,
+        ) = aux
+
+        # Construct without calling __init__ or __post_init__
+        self = cls.__new__(cls)
+
+        # Manually set attributes
+        self.snr_ratio = snr_ratio
+        self.emitter = emitter
+        self.receivers_p = receivers_p
+        self.receivers_v = receivers_v
+        self.timesteps = timesteps
+        self.transmitted_freq_shifts = transmitted_freq_shifts
+        self.channel_attenuation = channel_attenuation
+        self.channel_phase = channel_phase
+
+        self.seed = seed
+        self.rng = rng
+        self.num_receivers = num_receivers
+        self.num_samples_per_interval = num_samples_per_interval
+        self.num_timesteps = num_timesteps
+        self.sample_rate = sample_rate
+
+        return self
+
+    @classmethod
+    def copy(cls, params: Self, seed: Optional[int] = None, snr_ratio: Optional[float] = None):
+        if seed is None:
+            seed = params.seed
+        if snr_ratio is None:
+            snr_ratio = params.snr_ratio
+
+        return replace(params, seed=seed, snr_ratio=snr_ratio)
 
 class DefaultPosition(enum.StrEnum):
     PosA = 'A'
@@ -141,7 +201,6 @@ def init_position(position: DefaultPosition, seed: int = 42, snr_ratio: float = 
         receivers_v=jnp.stack([v_x, v_y], dtype=jnp.float32)
     )
 
-@jax.jit
 def calculate_mu(
         p0: Float[Array, "2"],
         p_lk: Float[Array, "2 k l"],
@@ -190,33 +249,86 @@ def qpsk_signal(seed: int, k: int, N: int) -> Float[Array, "k N"]:
 
     return jax.vmap(gen_one, in_axes=0)(bits)
 
-def calculate_signal(p, b, transmitted_freq_shifts, s, receiver_p, receiver_v, exps):
-    mu: Float[Array, "k l"] = calculate_mu(p, receiver_p, receiver_v, PROPOGATION_SPEED_VAL)
-    A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
-    C: Complex[Array, "k n"] = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', transmitted_freq_shifts, exps))
-
-    signal = (b[:, :, None] * A * C[:, None, :] * s[:, None, :])
-    return signal
-
-def simulate_signal(params: Params, s: Float[Array, "k n"]) -> Complex[Array, "k l n"]:
+def simulate_noisefree_signal(params: Params, s: Complex[Array, "k n"]) -> Complex[Array, "k l n"]:
     k, l, N = params.num_timesteps, params.num_receivers, params.num_samples_per_interval
 
     b: Complex[Array, "k l"] = params.channel_attenuation * jnp.exp(1j * params.channel_phase * jnp.ones((k, l)))
 
-    T_s = params.num_samples_per_interval / params.sample_rate
+    T_s = 1.0 / params.sample_rate
     exps: Float[Array, "N"] = jnp.arange(params.num_samples_per_interval) * T_s
 
-    signal = calculate_signal(params.emitter, b, params.transmitted_freq_shifts, s, params.receivers_p, params.receivers_v, exps)
+    mu: Float[Array, "k l"] = calculate_mu(params.emitter, params.receivers_p, params.receivers_v, PROPOGATION_SPEED_VAL)
+    A: Complex[Array, "k l n"] = jnp.exp(1j * 2 * jnp.pi * NOMINAL_CARRIER_FREQUENCY_VAL * jnp.einsum('kl,n->kln', mu, exps))
+    C: Complex[Array, "k n"] = jnp.exp(1j * 2 * jnp.pi * jnp.einsum('k,n->kn', params.transmitted_freq_shifts, exps))
+    signal = (b[:, :, None] * A * C[:, None, :] * s[:, None, :])
+
+    return signal
+
+@jax.jit
+def simulate_signal(params: Params, s: Complex[Array, "k n"]) -> Complex[Array, "k l n"]:
+    k, l, N = params.num_timesteps, params.num_receivers, params.num_samples_per_interval
+
+    signal = simulate_noisefree_signal(params, s)
 
     params.rng, k2 = jax.random.split(params.rng)
     signal_power = jnp.mean(jnp.abs(signal) ** 2)
     noise_variance = signal_power / (10 ** (params.snr_ratio / 10))
     noise_stddev = jnp.sqrt(noise_variance)
 
-    w = jax.random.normal(k2, shape=(2, k, l, N)) * noise_stddev / 2
+    w = jax.random.normal(k2, shape=(2, k, l, N)) * noise_stddev / jnp.sqrt(2)
     w = w[0] + w[1] * 1.0j
 
     return (signal + w)
+
+
+def calculate_crlb(params: Params, signal: Complex[Array, "k N"], known=False, num_samples=100):
+    def wrap_simulate_noisefree_signal(args):
+        params_recon, signal_real, signal_imag = unravel_fn(args)
+        out = simulate_noisefree_signal(params_recon, signal_real + 1.0j * signal_imag)
+        return (jnp.real(out), jnp.imag(out))
+
+    def sigma2_of_theta(th):
+        p_recon, s_r, s_i = unravel_fn(th)
+        mu_t = simulate_noisefree_signal(p_recon, s_r + 1.0j * s_i)
+        pw = jnp.mean(jnp.abs(mu_t) ** 2)
+        snr_l = 10.0 ** (p_recon.snr_ratio / 10.0)
+        return pw / snr_l
+
+    seeds = jnp.arange(params.seed, params.seed + num_samples)
+
+    sum_fim: Optional[Float[Array, "params params"]] = None
+
+    for seed in seeds:
+        curr_params = Params.copy(params, seed=int(seed))
+
+        theta, unravel_fn = ravel_pytree((curr_params, jnp.real(signal), jnp.imag(signal)))
+        num_params = theta.shape[0]
+
+        (J_r, J_i) = jax.jacfwd(wrap_simulate_noisefree_signal)(theta)
+        J_s = J_r + 1.0j * J_i
+        J_s = J_s.reshape(-1, num_params)
+        D = J_s.shape[0]
+
+        sigma2, J_var = jax.value_and_grad(sigma2_of_theta)(theta)
+
+        fim = 2.0 / sigma2 * jnp.real(jnp.conj(J_s).T @ J_s) + (D / (sigma2 ** 2)) * (J_var[:, None] @ J_var[None, :])
+        sum_fim: Float[Array, "params params"] = fim if (sum_fim is None) else (sum_fim + fim)
+
+    F_avg = jnp.real(sum_fim / float(num_samples))
+    crlb = jnp.linalg.pinv(F_avg)
+    # print((jnp.linalg.eigvals(crlb) < 1e-3).sum(), crlb.shape)
+    # print((jnp.linalg.eigvals(F_avg) < 1e-3).sum(), F_avg.shape)
+
+    # eigvals = jnp.linalg.eigvalsh(F_avg)
+    # cond = jnp.max(jnp.abs(eigvals)) / jnp.maximum(jnp.min(jnp.abs(eigvals)), 1e-30)
+    # print("F shape:", F_avg.shape)
+    # print("eigvals (smallest 10):", eigvals[:10])
+    # print("min eig, max eig, cond:", eigvals.min(), eigvals.max(), cond)
+
+    crlb_emitter_x = jnp.real(crlb[0, 0])
+    crlb_emitter_y = jnp.real(crlb[1, 1])
+
+    return crlb_emitter_x, crlb_emitter_y, 1 / F_avg[0][0], 1 / F_avg[1][1]
 
 @jax.jit
 def compute_cost_dd(
@@ -309,7 +421,7 @@ def estimate_position(
     grid = jnp.mgrid[p_min:p_max:p_step, p_min:p_max:p_step].reshape(2, -1)
     num_points = grid.shape[1]
 
-    T_s = params.num_samples_per_interval / params.sample_rate
+    T_s = 1.0 / params.sample_rate
     exps: Float[Array, "N"] = jnp.arange(params.num_samples_per_interval) * T_s
 
     # we reshape to batches to prevent XLA from unrolling everything into one massive graph
@@ -348,6 +460,7 @@ def estimate_position(
 
     return ests, data
 
+
 if __name__ == '__main__':
     import time
 
@@ -364,11 +477,14 @@ if __name__ == '__main__':
 
             signal = simulate_signal(params, transmitted_signal)
 
+            crlb = calculate_crlb(params, signal, known=False, num_samples=1)
+            print(f"CRLB: {crlb}")
+
             start = time.time()
             estimate, data = estimate_position(
                 params,
                 signal,
-                EstimationMethod.DifferentialDoppler,
+                EstimationMethod.DirectPosition,
                 0.0,
                 10_000.0,
                 100.0, # 100x100 grid
