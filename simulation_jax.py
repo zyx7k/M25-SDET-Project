@@ -333,7 +333,7 @@ def estimate_position(
 
 if __name__ == '__main__':
     import time
-    for seed in range(1000, 1100):
+    for seed in range(1000, 1010):
         for idx, pos in enumerate([DefaultPosition.PosA, DefaultPosition.PosB, DefaultPosition.PosC, DefaultPosition.PosD]):
             print(f"\n--- Simulation: {pos} ---")
             params = init_position(pos, seed=seed)
@@ -351,7 +351,7 @@ if __name__ == '__main__':
                 0.0,
                 10_000.0,
                 25.0, # 100x100 grid
-                prior_signal=transmitted_signal
+                # prior_signal=transmitted_signal
             )
 
             end = time.time()
@@ -362,17 +362,17 @@ if __name__ == '__main__':
 
             print(f"Estimate: ({est[0]:.2f}, {est[1]:.2f})")
             err = jnp.sum(jnp.sqrt((params.emitter - est)**2))
-            # print(f'# of min. points: {jnp.sum(data['cost'] == data['cost'].max())}')
-            # data = pd.DataFrame(data)
-            # (
-            #     p9.ggplot(data, p9.aes("xs", "ys", fill="cost"))
-            #     + p9.geom_tile()
-            #     + p9.geom_vline(xintercept=params.emitter[0])
-            #     + p9.geom_hline(yintercept=params.emitter[1])
-            #     + p9.geom_vline(xintercept=est[0], linetype="dotted")
-            #     + p9.geom_hline(yintercept=est[1], linetype="dotted")
-            #     + p9.theme_minimal()
-            # ).save(f'jax_plots/qpsk_{idx}_{SEED}.png', dpi=300, width=5, height=5)
+            print(f'# of min. points: {jnp.sum(data['cost'] == data['cost'].max())}')
+            data = pd.DataFrame(data)
+            (
+                p9.ggplot(data, p9.aes("xs", "ys", fill="cost"))
+                + p9.geom_tile()
+                + p9.geom_vline(xintercept=params.emitter[0])
+                + p9.geom_hline(yintercept=params.emitter[1])
+                + p9.geom_vline(xintercept=est[0], linetype="dotted")
+                + p9.geom_hline(yintercept=est[1], linetype="dotted")
+                + p9.theme_minimal()
+            ).save(f'jax_plots/unknown_qpsk_{idx}_{seed}.png', dpi=300, width=5, height=5)
 
             print(f"Error: {err} m (Computed in {(end-start) * 1000:.3f}ms)")
         # break
